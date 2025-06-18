@@ -160,7 +160,7 @@ $(CURL_INSTALL_DIR)/lib/libcurl.a:
 ifeq ($(UNAME_S),Darwin)
 	cd curl/curl && patch configure < ../configure.patch
 endif
-	cd curl/curl && CPPFLAGS="-I$(SSL_IDIR)" LDFLAGS="-L$(SSL_LDIR)" ./configure --prefix=$(CURL_INSTALL_DIR) --disable-debug --disable-ftp --disable-ldap --disable-ldaps --disable-rtsp --disable-proxy --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-manual --disable-ipv6 --disable-sspi --disable-ntlm --disable-tls-srp --without-nghttp2 --without-libidn2 --without-libssh2 --without-brotli --without-librtmp --without-libpsl --without-zstd --with-openssl --disable-shared
+	cd curl/curl && CPPFLAGS="-I$(SSL_IDIR)" LDFLAGS="-L$(SSL_LDIR)" ./configure --prefix=$(CURL_INSTALL_DIR) --disable-debug --disable-ftp --disable-ldap --disable-ldaps --disable-rtsp --disable-proxy --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-manual --disable-ipv6 --disable-sspi --disable-ntlm --disable-tls-srp --without-nghttp2 --without-libidn2 --without-libssh2 --without-brotli --without-librtmp --without-libpsl --without-zstd --with-openssl
 	cd curl/curl && CFLAGS=-fPIC CC=${CC} CXX=${CXX} ${MAKE}
 	cd curl/curl && ${MAKE} install
 
