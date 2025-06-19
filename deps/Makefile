@@ -381,7 +381,7 @@ ifneq (,$(filter $(DISTRO)$(DISTVERS),almalinux8 opensuse15))
 	cd abseil/abseil-cpp && patch -p0 < ../constexpr.patch
 endif
 	cd abseil/abseil-cpp && mkdir -p build
-	cd abseil/abseil-cpp/build && cmake .. $(CMAKE_COMMON_FLAGS) -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=$(ABSL_INSTALL_DIR) -DBUILD_TESTING=OFF
+	cd abseil/abseil-cpp/build && cmake .. $(CMAKE_COMMON_FLAGS) -DCMAKE_INSTALL_PREFIX=$(ABSL_INSTALL_DIR) -DBUILD_TESTING=OFF
 	cd abseil/abseil-cpp/build && CC=${CC} CXX=${CXX} ${MAKE}
 	cd abseil/abseil-cpp/build && ${MAKE} install
 	cd $(ABSL_INSTALL_DIR)/lib && ls libabsl_*.a | xargs -n1 ${AR} -x
