@@ -161,7 +161,7 @@ clickhouse-cpp/clickhouse-cpp/clickhouse/libclickhouse-cpp-lib-static.a:
 	cd clickhouse-cpp && tar -zxf v2.3.0.tar.gz
 	cd clickhouse-cpp && ln -fs clickhouse-cpp-*/ clickhouse-cpp
 	cd clickhouse-cpp/clickhouse-cpp && patch clickhouse/base/wire_format.h < ../wire_format.patch
-	cd clickhouse-cpp/clickhouse-cpp && cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo .
+	cd clickhouse-cpp/clickhouse-cpp && cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .
 	cd clickhouse-cpp/clickhouse-cpp && CC=${CC} CXX=${CXX} ${MAKE}
 
 clickhouse-cpp: clickhouse-cpp/clickhouse-cpp/clickhouse/libclickhouse-cpp-lib-static.a
@@ -361,4 +361,3 @@ cleanall:
 	cd libusual && rm -rf libusual-*/ || true
 	cd libscram && rm -rf lib/* obj/* || true
 .PHONY: cleanall
-

@@ -2808,6 +2808,12 @@ void ProxySQL_Admin::init_pgsql_variables() {
 	flush_pgsql_variables___database_to_runtime(admindb, true);
 }
 
+void ProxySQL_Admin::init_otel_variables() {
+	flush_otel_variables___database_to_runtime(admindb, true);
+	flush_otel_variables___runtime_to_database(configdb, false, false, false);
+	flush_otel_variables___runtime_to_database(admindb, false, true, false);
+}
+
 void ProxySQL_Admin::admin_shutdown() {
 	int i;
 //	do { usleep(50); } while (main_shutdown==0);
