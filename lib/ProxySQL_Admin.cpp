@@ -292,14 +292,6 @@ struct cpu_timer
 	unsigned long long begin;
 };
 
-char *s_strdup(char *s) {
-	char *ret=NULL;
-	if (s) {
-		ret=strdup(s);
-	}
-	return ret;
-}
-
 int admin_load_main_=0;
 bool admin_nostart_=false;
 
@@ -8471,4 +8463,3 @@ void ProxySQL_Admin::enable_replicationlag_testing() {
 	mysql_servers_wrunlock();
 }
 #endif // TEST_REPLICATIONLAG
-

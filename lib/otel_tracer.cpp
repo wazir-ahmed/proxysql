@@ -1,11 +1,13 @@
 #include "otel_tracer.h"
+#include "cpp.h"
 #include <cstdint>
 #include <cstdio>
 #include <inttypes.h>
 
-#define OTEL_SERVICE_NAME_DEFAULT "proxysql"
-#define OTEL_OTLP_PROTO_DEFAULT "http/protobuf"
-#define OTEL_OTLP_COMPRESSION "none"
+#define OTEL_SERVICE_NAME_DEFAULT		"proxysql"
+#define OTEL_OTLP_PROTO_DEFAULT			"http/protobuf"
+#define OTEL_OTLP_ENDPOINT_DEFAULT		"http://127.0.0.1:4318"
+#define OTEL_OTLP_COMPRESSION_DEFAULT	"none"
 
 using std::string;
 
@@ -40,7 +42,8 @@ OTelTracer::OTelTracer() : variables{} {
 
 	variables.service_name = strdup(OTEL_SERVICE_NAME_DEFAULT);
 	variables.exporter_otlp_protocol = strdup(OTEL_OTLP_PROTO_DEFAULT);
-	variables.exporter_otlp_compression = strdup(OTEL_OTLP_COMPRESSION);
+	variables.exporter_otlp_endpoint = strdup(OTEL_OTLP_ENDPOINT_DEFAULT);
+	variables.exporter_otlp_compression = strdup(OTEL_OTLP_COMPRESSION_DEFAULT);
 }
 
 OTelTracer::~OTelTracer() {
@@ -90,44 +93,56 @@ char * OTelTracer::get_variable(const char* key) {
 		return strdup(variables.trace_enable ? "true" : "false");
 
 	if (strcasecmp(key,"trace_service_name") == 0)
-		return strdup(variables.service_name);
+		return s_strdup(variables.service_name);
 
 	if (strcasecmp(key,"trace_resource_attributes") == 0)
-		return strdup(variables.resource_attributes);
+		return s_strdup(variables.resource_attributes);
 
 	if (strcasecmp(key,"trace_exporter_otlp_protocol") == 0)
-		return strdup(variables.exporter_otlp_protocol);
+		return s_strdup(variables.exporter_otlp_protocol);
 
 	if (strcasecmp(key,"trace_exporter_otlp_endpoint") == 0)
-		return strdup(variables.exporter_otlp_endpoint);
+		return s_strdup(variables.exporter_otlp_endpoint);
 
 	if (strcasecmp(key,"trace_exporter_otlp_headers") == 0)
-		return strdup(variables.exporter_otlp_headers);
+		return s_strdup(variables.exporter_otlp_headers);
 
 	if (strcasecmp(key,"trace_exporter_otlp_certificates") == 0)
-		return strdup(variables.exporter_otlp_certificates);
+		return s_strdup(variables.exporter_otlp_certificates);
 
 	if (strcasecmp(key,"trace_exporter_otlp_compression") == 0)
-		return strdup(variables.exporter_otlp_compression);
+		return s_strdup(variables.exporter_otlp_compression);
 
 	if (strcasecmp(key,"trace_exporter_otlp_timeout") == 0) {
-		sprintf(buf, "%" PRId64, variables.exporter_otlp_timeout);
-		return strdup(buf);
+		if (variables.exporter_otlp_timeout > 0) {
+			sprintf(buf, "%" PRId64, variables.exporter_otlp_timeout);
+			return strdup(buf);
+		}
+		return nullptr;
 	}
 
 	if (strcasecmp(key,"trace_bsp_schedule_delay") == 0) {
-		sprintf(buf, "%" PRId64, variables.bsp_schedule_delay);
-		return strdup(buf);
+		if (variables.bsp_schedule_delay > 0) {
+			sprintf(buf, "%" PRId64, variables.bsp_schedule_delay);
+			return strdup(buf);
+		}
+		return nullptr;
 	}
 
 	if (strcasecmp(key,"trace_bsp_max_queue_size") == 0) {
-		sprintf(buf, "%zu", variables.bsp_max_queue_size);
-		return strdup(buf);
+		if (variables.bsp_max_queue_size > 0) {
+			sprintf(buf, "%zu", variables.bsp_max_queue_size);
+			return strdup(buf);
+		}
+		return nullptr;
 	}
 
 	if (strcasecmp(key,"trace_bsp_max_export_batch_size") == 0) {
-		sprintf(buf, "%zu", variables.bsp_max_export_batch_size);
-		return strdup(buf);
+		if (variables.bsp_max_export_batch_size > 0) {
+			sprintf(buf, "%zu", variables.bsp_max_export_batch_size);
+			return strdup(buf);
+		}
+		return nullptr;
 	}
 
 	return NULL;
