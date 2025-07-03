@@ -238,6 +238,10 @@ MYCXXFLAGS += $(IDIRS) $(OPTZ) $(DEBUG) $(PSQLCH) -DGITVERSION=\"$(GIT_VERSION)\
 STATICMYLIBS := -Wl,-Bstatic    \
 				-lconfig        \
 				-lproxysql      \
+				-lopentelemetry \
+				-lprotobuf      \
+				-lutf8          \
+				-labsl          \
 				-ldaemon        \
 				-lconfig++      \
 				-lre2           \
@@ -253,11 +257,7 @@ STATICMYLIBS := -Wl,-Bstatic    \
 				-lusual         \
 				-lpq            \
 				-lpgcommon      \
-				-lpgport        \
-				-labsl          \
-				-lprotobuf      \
-				-lutf8          \
-				-lopentelemetry
+				-lpgport
 
 ifneq ($(NOJEMALLOC),1)
 	STATICMYLIBS += -ljemalloc
