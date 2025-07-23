@@ -1,0 +1,185 @@
+--- exporters/otlp/include/opentelemetry/exporters/otlp/otlp_recordable.h.orig	2025-07-23 13:56:26.805751062 +0530
++++ exporters/otlp/include/opentelemetry/exporters/otlp/otlp_recordable.h	2025-07-23 13:58:16.346107582 +0530
+@@ -7,6 +7,7 @@
+ #include <string>
+ 
+ // clang-format off
++#include "google/protobuf/arena.h"
+ #include "opentelemetry/exporters/otlp/protobuf_include_prefix.h" // IWYU pragma: keep
+ #include "opentelemetry/proto/common/v1/common.pb.h"
+ #include "opentelemetry/proto/resource/v1/resource.pb.h"
+@@ -35,8 +36,18 @@
+ class OtlpRecordable final : public opentelemetry::sdk::trace::Recordable
+ {
+ public:
+-  proto::trace::v1::Span &span() noexcept { return span_; }
+-  const proto::trace::v1::Span &span() const noexcept { return span_; }
++  explicit OtlpRecordable(google::protobuf::Arena *arena = nullptr) 
++    : arena_(arena), span_(arena ? google::protobuf::Arena::Create<proto::trace::v1::Span>(arena) 
++                                 : new proto::trace::v1::Span()) {}
++
++  ~OtlpRecordable() {
++    if (!arena_ && span_) {
++      delete span_;
++    }
++  }
++
++  proto::trace::v1::Span &span() noexcept { return *span_; }
++  const proto::trace::v1::Span &span() const noexcept { return *span_; }
+ 
+   /** Dynamically converts the resource of this span into a proto. */
+   proto::resource::v1::Resource ProtoResource() const noexcept;
+@@ -81,7 +92,8 @@
+                                    &instrumentation_scope) noexcept override;
+ 
+ private:
+-  proto::trace::v1::Span span_;
++  google::protobuf::Arena *arena_;
++  proto::trace::v1::Span *span_;
+   const opentelemetry::sdk::resource::Resource *resource_ = nullptr;
+   const opentelemetry::sdk::instrumentationscope::InstrumentationScope *instrumentation_scope_ =
+       nullptr;
+--- exporters/otlp/src/otlp_recordable.cc.orig	2025-07-23 11:07:47.129990175 +0530
++++ exporters/otlp/src/otlp_recordable.cc	2025-07-23 11:07:47.233993318 +0530
+@@ -43,16 +43,17 @@
+ void OtlpRecordable::SetIdentity(const opentelemetry::trace::SpanContext &span_context,
+                                  opentelemetry::trace::SpanId parent_span_id) noexcept
+ {
+-  span_.set_trace_id(reinterpret_cast<const char *>(span_context.trace_id().Id().data()),
++  span_->set_trace_id(reinterpret_cast<const char *>(span_context.trace_id().Id().data()),
+                      trace::TraceId::kSize);
+-  span_.set_span_id(reinterpret_cast<const char *>(span_context.span_id().Id().data()),
++  span_->set_span_id(reinterpret_cast<const char *>(span_context.span_id().Id().data()),
+                     trace::SpanId::kSize);
+   if (parent_span_id.IsValid())
+   {
+-    span_.set_parent_span_id(reinterpret_cast<const char *>(parent_span_id.Id().data()),
++    span_->set_parent_span_id(reinterpret_cast<const char *>(parent_span_id.Id().data()),
+                              trace::SpanId::kSize);
+   }
+-  span_.set_trace_state(span_context.trace_state()->ToHeader());
++  span_->set_trace_state(span_context.trace_state()->ToHeader());
++  span_->set_flags(span_context.trace_flags().flags());
+ }
+ 
+ proto::resource::v1::Resource OtlpRecordable::ProtoResource() const noexcept
+@@ -120,7 +121,7 @@
+ void OtlpRecordable::SetAttribute(nostd::string_view key,
+                                   const common::AttributeValue &value) noexcept
+ {
+-  auto *attribute = span_.add_attributes();
++  auto *attribute = span_->add_attributes();
+   OtlpPopulateAttributeUtils::PopulateAttribute(attribute, key, value);
+ }
+ 
+@@ -128,7 +129,7 @@
+                               common::SystemTimestamp timestamp,
+                               const common::KeyValueIterable &attributes) noexcept
+ {
+-  auto *event = span_.add_events();
++  auto *event = span_->add_events();
+   event->set_name(name.data(), name.size());
+   event->set_time_unix_nano(timestamp.time_since_epoch().count());
+ 
+@@ -141,7 +142,7 @@
+ void OtlpRecordable::AddLink(const trace::SpanContext &span_context,
+                              const common::KeyValueIterable &attributes) noexcept
+ {
+-  auto *link = span_.add_links();
++  auto *link = span_->add_links();
+   link->set_trace_id(reinterpret_cast<const char *>(span_context.trace_id().Id().data()),
+                      trace::TraceId::kSize);
+   link->set_span_id(reinterpret_cast<const char *>(span_context.span_id().Id().data()),
+@@ -155,23 +156,23 @@
+ 
+ void OtlpRecordable::SetStatus(trace::StatusCode code, nostd::string_view description) noexcept
+ {
+-  span_.mutable_status()->set_code(proto::trace::v1::Status_StatusCode(code));
++  span_->mutable_status()->set_code(proto::trace::v1::Status_StatusCode(code));
+   if (code == trace::StatusCode::kError)
+   {
+-    span_.mutable_status()->set_message(description.data(), description.size());
++    span_->mutable_status()->set_message(description.data(), description.size());
+   }
+ }
+ 
+ void OtlpRecordable::SetName(nostd::string_view name) noexcept
+ {
+-  span_.set_name(name.data(), name.size());
++  span_->set_name(name.data(), name.size());
+ }
+ 
+ void OtlpRecordable::SetTraceFlags(opentelemetry::trace::TraceFlags flags) noexcept
+ {
+   uint32_t all_flags = flags.flags() & opentelemetry::proto::trace::v1::SPAN_FLAGS_TRACE_FLAGS_MASK;
+ 
+-  span_.set_flags(all_flags);
++  span_->set_flags(all_flags);
+ }
+ 
+ void OtlpRecordable::SetSpanKind(trace::SpanKind span_kind) noexcept
+@@ -207,18 +208,18 @@
+       proto_span_kind = proto::trace::v1::Span_SpanKind::Span_SpanKind_SPAN_KIND_UNSPECIFIED;
+   }
+ 
+-  span_.set_kind(proto_span_kind);
++  span_->set_kind(proto_span_kind);
+ }
+ 
+ void OtlpRecordable::SetStartTime(common::SystemTimestamp start_time) noexcept
+ {
+-  span_.set_start_time_unix_nano(start_time.time_since_epoch().count());
++  span_->set_start_time_unix_nano(start_time.time_since_epoch().count());
+ }
+ 
+ void OtlpRecordable::SetDuration(std::chrono::nanoseconds duration) noexcept
+ {
+-  const uint64_t unix_end_time = span_.start_time_unix_nano() + duration.count();
+-  span_.set_end_time_unix_nano(unix_end_time);
++  const uint64_t unix_end_time = span_->start_time_unix_nano() + duration.count();
++  span_->set_end_time_unix_nano(unix_end_time);
+ }
+ 
+ void OtlpRecordable::SetInstrumentationScope(
+--- exporters/otlp/src/otlp_http_exporter.cc.orig	2025-07-23 11:07:47.754009033 +0530
++++ exporters/otlp/src/otlp_http_exporter.cc	2025-07-23 11:07:47.858012176 +0530
+@@ -136,8 +136,17 @@
+ 
+ std::unique_ptr<opentelemetry::sdk::trace::Recordable> OtlpHttpExporter::MakeRecordable() noexcept
+ {
++  // Create shared arena if not exists (thread-local approach for better performance)
++  static thread_local std::unique_ptr<google::protobuf::Arena> shared_arena;
++  if (!shared_arena) {
++    google::protobuf::ArenaOptions options;
++    options.initial_block_size = 1048576;  // 1MB for multiple spans
++    options.max_block_size = 10485760;     // 10MB max
++    shared_arena = std::make_unique<google::protobuf::Arena>(options);
++  }
++  
+   return std::unique_ptr<opentelemetry::sdk::trace::Recordable>(
+-      new exporter::otlp::OtlpRecordable());
++      new exporter::otlp::OtlpRecordable(shared_arena.get()));
+ }
+ 
+ opentelemetry::sdk::common::ExportResult OtlpHttpExporter::Export(
+--- exporters/otlp/src/otlp_grpc_exporter.cc.orig	2025-07-23 11:07:47.962015319 +0530
++++ exporters/otlp/src/otlp_grpc_exporter.cc	2025-07-23 11:07:48.066018462 +0530
+@@ -76,7 +76,17 @@
+ 
+ std::unique_ptr<sdk::trace::Recordable> OtlpGrpcExporter::MakeRecordable() noexcept
+ {
+-  return std::unique_ptr<sdk::trace::Recordable>(new OtlpRecordable);
++  // Create shared arena if not exists (thread-local approach for better performance)
++  static thread_local std::unique_ptr<google::protobuf::Arena> shared_arena;
++  if (!shared_arena) {
++    google::protobuf::ArenaOptions options;
++    options.initial_block_size = 1048576;  // 1MB for multiple spans
++    options.max_block_size = 10485760;    // 10MB max
++    shared_arena = std::make_unique<google::protobuf::Arena>(options);
++  }
++  
++  return std::unique_ptr<sdk::trace::Recordable>(
++      new OtlpRecordable(shared_arena.get()));
+ }
+ 
+ sdk::common::ExportResult OtlpGrpcExporter::Export(

@@ -234,8 +234,14 @@ ifeq ($(CXX),clang++)
 endif
 MYCXXFLAGS += $(IDIRS) $(OPTZ) $(DEBUG) $(PSQLCH) -DGITVERSION=\"$(GIT_VERSION)\" $(NOJEM) $(WGCOV) $(WASAN)
 
-STATICMYLIBS := -Wl,-Bstatic    \
-				-lconfig        \
+STATICMYLIBS := -Wl,-Bstatic
+
+# Force jemalloc to be linked FIRST with --no-as-needed to ensure ALL libraries use jemalloc
+ifneq ($(NOJEMALLOC),1)
+	STATICMYLIBS += -Wl,--no-as-needed -ljemalloc -Wl,--as-needed
+endif
+
+STATICMYLIBS += -lconfig        \
 				-lproxysql      \
 				-lopentelemetry \
 				-lprotobuf      \
@@ -258,9 +264,6 @@ STATICMYLIBS := -Wl,-Bstatic    \
 				-lpgcommon      \
 				-lpgport
 
-ifneq ($(NOJEMALLOC),1)
-	STATICMYLIBS += -ljemalloc
-endif
 ifeq ($(UNAME_S),Linux)
 	STATICMYLIBS += -lcoredumper
 endif
