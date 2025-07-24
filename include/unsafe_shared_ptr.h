@@ -1,6 +1,7 @@
 #ifndef __CLASS_UNSAFE_SHARED_PTR_H
 #define __CLASS_UNSAFE_SHARED_PTR_H
 
+#include <memory>
 #include <cstddef>
 
 /**
@@ -31,6 +32,8 @@ public:
 		if (ref_count_)
 			++(*ref_count_);
 	}
+
+	unsafe_shared_ptr(T&& obj) : ptr_(new T(std::move(obj))) {}
 
 	unsafe_shared_ptr(unsafe_shared_ptr&& other) noexcept
 		: ptr_(other.ptr_), ref_count_(other.ref_count_) {

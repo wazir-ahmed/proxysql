@@ -1,0 +1,39 @@
+--- ../span_context.h.orig	2025-07-24 12:13:16.149244630 +0530
++++ api/include/opentelemetry/trace/span_context.h	2025-07-24 12:13:14.069254738 +0530
+@@ -35,8 +35,7 @@
+       : trace_id_(),
+         span_id_(),
+         trace_flags_(trace::TraceFlags(static_cast<uint8_t>(sampled_flag))),
+-        is_remote_(is_remote),
+-        trace_state_(TraceState::GetDefault())
++        is_remote_(is_remote)
+   {}
+ 
+   SpanContext(TraceId trace_id,
+@@ -47,8 +46,7 @@
+       : trace_id_(trace_id),
+         span_id_(span_id),
+         trace_flags_(trace_flags),
+-        is_remote_(is_remote),
+-        trace_state_(std::move(trace_state))
++        is_remote_(is_remote)
+   {}
+ 
+   SpanContext(const SpanContext &ctx) = default;
+@@ -66,7 +64,7 @@
+   const trace::SpanId &span_id() const noexcept { return span_id_; }
+ 
+   // @returns the trace_state associated with this span_context
+-  const nostd::shared_ptr<trace::TraceState> &trace_state() const noexcept { return trace_state_; }
++  const nostd::shared_ptr<trace::TraceState> trace_state() const noexcept { return TraceState::GetDefault(); }
+ 
+   /*
+    * @param that SpanContext for comparing.
+@@ -92,7 +90,6 @@
+   trace::SpanId span_id_;
+   trace::TraceFlags trace_flags_;
+   bool is_remote_;
+-  nostd::shared_ptr<trace::TraceState> trace_state_;
+ };
+ }  // namespace trace
+ OPENTELEMETRY_END_NAMESPACE
