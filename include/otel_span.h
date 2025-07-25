@@ -1,6 +1,7 @@
 #ifndef __CLASS_PROXYSQL_OTEL_SPAN_H
 #define __CLASS_PROXYSQL_OTEL_SPAN_H
 
+#include <cstddef>
 #include <memory>
 #include <signal.h>
 #include <utility>
@@ -26,30 +27,41 @@ using OTelSpanAttrVal = otel_common::AttributeValue;
 
 class OTelSpanStack {
 private:
-	std::vector<OTelSpanCtx> store;
-	bool contains(const OTelSpanCtx& ctx);
+	std::vector<unsafe_shared_ptr<OTelSpanCtx>> store;
+	bool contains(const unsafe_shared_ptr<OTelSpanCtx> ctx);
 
 public:
 	OTelSpanStack(int capacity = OTEL_SPAN_STACK_SIZE_DEFAULT) { store.reserve(capacity); }
 	~OTelSpanStack() = default;
 
-	OTelSpanCtx GetCurrent();
-	void Attach(const OTelSpanCtx& ctx) { store.push_back(ctx); }
-	void Detach(const OTelSpanCtx& ctx);
+	unsafe_shared_ptr<OTelSpanCtx> GetCurrent();
+	void Attach(const unsafe_shared_ptr<OTelSpanCtx> ctx);
+	void Detach(const unsafe_shared_ptr<OTelSpanCtx> ctx);
 };
 
-inline OTelSpanCtx OTelSpanStack::GetCurrent() {
+inline unsafe_shared_ptr<OTelSpanCtx> OTelSpanStack::GetCurrent() {
 	if (!store.empty())
 		return store.back();
-	else
-	 	return OTelSpanCtx::GetInvalid();
+	else {
+	 	return nullptr;
+	}
 }
 
-inline void OTelSpanStack::Detach(const OTelSpanCtx& ctx) {
+inline void OTelSpanStack::Attach(const unsafe_shared_ptr<OTelSpanCtx> ctx) {
+	if (!ctx)
+		return;
+
+	store.push_back(ctx);
+}
+
+inline void OTelSpanStack::Detach(const unsafe_shared_ptr<OTelSpanCtx> ctx) {
+	if (!ctx)
+		return;
+
 	if (store.empty())
 		return;
 
-	if (ctx == store.back()) {
+	if (ctx->span_id() == store.back()->span_id()) {
 		store.pop_back();
 		return;
 	}
@@ -78,14 +90,17 @@ inline void OTelSpanStack::Detach(const OTelSpanCtx& ctx) {
 
 	do {
 		store.pop_back();
-	} while(!(ctx == store.back()));
+	} while(!(ctx->span_id() == store.back()->span_id()));
 
 	store.pop_back();
 }
 
-inline bool OTelSpanStack::contains(const OTelSpanCtx& ctx) {
+inline bool OTelSpanStack::contains(const unsafe_shared_ptr<OTelSpanCtx> ctx) {
+	if (!ctx)
+		return false;
+
 	for (auto it = store.rbegin(); it != store.rend(); ++it) {
-		if (ctx == *it) {
+		if (ctx->span_id() == (*it)->span_id()) {
 			return true;
 		}
 	}
@@ -95,12 +110,13 @@ inline bool OTelSpanStack::contains(const OTelSpanCtx& ctx) {
 class OTelSpan {
 private:
 	otel_nostd::shared_ptr<Span> span;
+	unsafe_shared_ptr<OTelSpanCtx> span_ctx;
 	unsafe_shared_ptr<OTelSpanStack> ctx_stack;
 
-	bool create_span(
+	void create_span(
 		otel_trace_api::Tracer* tracer,
 		const string& name,
-		const OTelSpanCtx& pctx
+		const unsafe_shared_ptr<OTelSpanCtx> pctx
 	);
 
 public:
@@ -109,40 +125,41 @@ public:
 	explicit OTelSpan(
 		otel_trace_api::Tracer* tracer,
 		const string& name,
-		const OTelSpanCtx& pctx = OTelSpanCtx::GetInvalid()
+		const unsafe_shared_ptr<OTelSpanCtx> pctx = nullptr
 	);
 
 	explicit OTelSpan(
 		otel_trace_api::Tracer* tracer,
 		const string& name,
-		unsafe_shared_ptr<OTelSpanStack>& stack
+		unsafe_shared_ptr<OTelSpanStack> stack
 	);
 
 	~OTelSpan();
 
 	void SetAttribute(const string& key, OTelSpanAttrVal value);
 	void UpdateName(const string& name);
+
 };
 
-inline OTelSpan::OTelSpan(otel_trace_api::Tracer* tracer, const string& name, const OTelSpanCtx& pctx) {
+inline OTelSpan::OTelSpan(otel_trace_api::Tracer* tracer, const string& name, const unsafe_shared_ptr<OTelSpanCtx> pctx) {
 	create_span(tracer, name, pctx);
 }
 
-inline OTelSpan::OTelSpan(otel_trace_api::Tracer* tracer, const string& name, unsafe_shared_ptr<OTelSpanStack>& stack) {
+inline OTelSpan::OTelSpan(otel_trace_api::Tracer* tracer, const string& name, unsafe_shared_ptr<OTelSpanStack> stack) {
 	if (stack) {
-		if (create_span(tracer, name, stack->GetCurrent())) {
-			stack->Attach(span->GetContext());
-			ctx_stack = stack;
-		}
+		create_span(tracer, name, stack->GetCurrent());
+		span_ctx.reset(new OTelSpanCtx(span->GetContext()));
+		stack->Attach(span_ctx);
+		ctx_stack = stack;
 		return;
 	}
 
-	create_span(tracer, name, OTelSpanCtx::GetInvalid());
+	create_span(tracer, name, nullptr);
 }
 
 inline OTelSpan::~OTelSpan() {
 	if (span && ctx_stack) {
-		ctx_stack->Detach(span->GetContext());
+		ctx_stack->Detach(span_ctx);
 	}
 }
 
@@ -158,12 +175,13 @@ inline void OTelSpan::UpdateName(const string& name) {
 	}
 }
 
-inline bool OTelSpan::create_span(otel_trace_api::Tracer* tracer, const string& name, const OTelSpanCtx& pctx) {
-	auto option = otel_trace_api::StartSpanOptions();
-	option.parent = pctx;
-	span = tracer->StartSpan(name, option);
+inline void OTelSpan::create_span(otel_trace_api::Tracer* tracer, const string& name, const unsafe_shared_ptr<OTelSpanCtx> pctx) {
+	static thread_local otel_trace_api::StartSpanOptions option;
 
-	return true;
+	if (pctx) {
+		option.parent = *pctx.get();
+	}
+	span = tracer->StartSpan(name, option);
 }
 
 #endif  // __CLASS_PROXYSQL_OTEL_SPAN_H
