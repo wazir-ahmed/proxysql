@@ -1908,10 +1908,12 @@ bool MySQL_Session::handler_again___verify_backend_session_track_gtids() {
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session %p , client: %s , backend: %s\n", this, client_myds->myconn->options.session_track_gtids, mybe->server_myds->myconn->options.session_track_gtids);
 	// we first verify that the backend supports it
 	// if backend is old (or if it is not mysql) ignore this setting
-	if ((mybe->server_myds->myconn->mysql->server_capabilities & CLIENT_SESSION_TRACKING) == 0) {
-		// the backend doesn't support CLIENT_SESSION_TRACKING
-		return ret; // exit immediately
+	if ((mybe->server_myds->myconn->mysql->server_capabilities & CLIENT_SESSION_TRACKING) == 0
+		|| (mybe->server_myds->myconn->mysql->server_capabilities & CLIENT_DEPRECATE_EOF) == 0
+		|| mysql_thread___enable_server_deprecate_eof == false) {
+		return ret;
 	}
+
 	uint32_t b_int = mybe->server_myds->myconn->options.session_track_gtids_int;
 	uint32_t f_int = client_myds->myconn->options.session_track_gtids_int;
 
@@ -1958,16 +1960,26 @@ bool MySQL_Session::handler_again___verify_backend_session_track_gtids() {
 }
 
 bool MySQL_Session::handler_again___verify_backend_session_track_variables() {
-	if (mysql_thread___session_track_variables == session_track_variables::DISABLED) {
+	int mode = mysql_thread___session_track_variables;
+
+	// skip enabling session variable tracking in the following cases
+	if (mode == session_track_variables::DISABLED) {
+		return false;
+	}
+	if ((mybe->server_myds->myconn->mysql->server_capabilities & CLIENT_SESSION_TRACKING) == 0
+		|| (mybe->server_myds->myconn->mysql->server_capabilities & CLIENT_DEPRECATE_EOF) == 0) {
+		return false;
+	}
+	if (!mysql_thread___enable_server_deprecate_eof && mode != session_track_variables::ENFORCED) {
 		return false;
 	}
 
+	// enable session tracking
 	if (mybe->server_myds->myconn->options.session_track_variables_sent == false) {
 		mybe->server_myds->myconn->options.session_track_variables_sent = true;
 		set_previous_status_mode3();
 		NEXT_IMMEDIATE_NEW(SETTING_SESSION_TRACK_VARIABLES);
 	}
-
 	if (mybe->server_myds->myconn->options.session_track_state_sent == false) {
 		mybe->server_myds->myconn->options.session_track_state_sent = true;
 		set_previous_status_mode3();
@@ -2937,6 +2949,11 @@ bool MySQL_Session::handler_again___status_CONNECTING_SERVER(int *_rc) {
 		}
 		enum session_status st=status;
 		if (mybe->server_myds->myconn->async_state_machine==ASYNC_IDLE) {
+			if (handle_session_track_capabilities() == false) {
+				pause_until = thread->curtime + mysql_thread___connect_retries_delay*1000;
+				return false;
+			}
+
 			st=previous_status.top();
 			previous_status.pop();
 			NEXT_IMMEDIATE_NEW(st);
@@ -2965,6 +2982,12 @@ bool MySQL_Session::handler_again___status_CONNECTING_SERVER(int *_rc) {
 				st=previous_status.top();
 				previous_status.pop();
 				myds->wait_until=0;
+
+				if (handle_session_track_capabilities() == false) {
+					pause_until = thread->curtime + mysql_thread___connect_retries_delay*1000;
+					set_status(CONNECTING_SERVER);
+					return false;
+				}
 
 				// NOTE: Even if a connection has correctly been created, since the CLIENT_DEPRECATE_EOF
 				// capability isn't always enforced to match for backend conns (no direct propagation), a
@@ -8270,4 +8293,42 @@ char* MySQL_Session::get_current_query(int max_length) {
 	}
 
 	return res;
+}
+
+/**
+ * @brief Handle session track capabilities validation.
+ *
+ * This function validates whether the backend connection has capabilities such as 'CLIENT_DEPRECATE_EOF'
+ * and 'CLIENT_SESSION_TRACKING' which are required to enable 'session_track_system_variables' in a MySQL session.
+ *
+ * If the connection lacks the capabilities and ProxySQL configuration is set in 'ENFORCED' mode, it returns the
+ * connection to the pool and set a backoff time for the backend server. This backoff time prevents the server from
+ * being selected again during connection pooling.
+ *
+ * @return 'true' if backend connection has required capabilities, otherwise returns 'false'.
+ */
+bool MySQL_Session::handle_session_track_capabilities() {
+	if (mysql_thread___session_track_variables != session_track_variables::ENFORCED) {
+		return true;
+	}
+
+	// this function should not be called in these states
+	if (mybe == NULL
+		|| mybe->server_myds == NULL
+		|| mybe->server_myds->myconn == NULL
+		|| mybe->server_myds->myconn->mysql == NULL) {
+		return true;
+	}
+
+	MySQL_Connection *be_conn = mybe->server_myds->myconn;
+	unsigned long srv_cap = be_conn->mysql->server_capabilities;
+
+	if ((srv_cap & CLIENT_DEPRECATE_EOF) == 0 || (srv_cap & CLIENT_SESSION_TRACKING) == 0) {
+		// be_conn->parent->server_backoff_time = thread->curtime + (600 * 1000000); // 10 minutes
+		be_conn->parent->server_backoff_time = thread->curtime + (30 * 1000000); // 30 seconds
+		mybe->server_myds->return_MySQL_Connection_To_Pool();
+		return false;
+	}
+
+	return true;
 }

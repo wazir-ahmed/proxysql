@@ -331,7 +331,8 @@ struct th_metrics_map_idx {
 struct session_track_variables {
 	enum mode {
 		DISABLED = 0,
-		ENABLED
+		OPTIONAL,
+		ENFORCED
 	};
 };
 
