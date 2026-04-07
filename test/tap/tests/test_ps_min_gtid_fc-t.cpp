@@ -26,7 +26,12 @@
 #include "utils.h"
 
 
-static int setup(MYSQL* admin, MYSQL* proxy) {
+/**
+ * @brief Hostgroup ID used to isolate test queries to a single known backend.
+ */
+static const int DEDICATED_HG = 59999;
+
+static int setup(MYSQL* admin, MYSQL* proxy, const CommandLine& cl) {
 	diag("========== Setup ==========");
 
 	MYSQL_QUERY_T(proxy, "CREATE DATABASE IF NOT EXISTS test");
@@ -34,8 +39,24 @@ static int setup(MYSQL* admin, MYSQL* proxy) {
 	MYSQL_QUERY_T(proxy, "CREATE TABLE test.ps_min_gtid_fc (id INT PRIMARY KEY)");
 	MYSQL_QUERY_T(proxy, "INSERT INTO test.ps_min_gtid_fc VALUES (1)");
 
+	// Create a dedicated hostgroup with a single known backend server.
+	// This ensures that min_gtid checks are evaluated against the same
+	// server whose GTID we fetch from stats, avoiding flakiness when
+	// multiple backends are connected in CI.
+	char server_query[512];
+	snprintf(server_query, sizeof(server_query),
+		"INSERT OR REPLACE INTO mysql_servers (hostgroup_id, hostname, port) VALUES (%d, '%s', %d)",
+		DEDICATED_HG, cl.mysql_host, cl.mysql_port);
+	MYSQL_QUERY_T(admin, server_query);
+	MYSQL_QUERY_T(admin, "LOAD MYSQL SERVERS TO RUNTIME");
+
 	MYSQL_QUERY_T(admin, "DELETE FROM mysql_query_rules");
-	MYSQL_QUERY_T(admin, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, replace_pattern, apply, comment) VALUES (42, 1, ';min_gtid=[\\:\\-\\w]+', '', 1, 'Remove min_gtid annotation')");
+	char rule_query[1024];
+	snprintf(rule_query, sizeof(rule_query),
+		"INSERT INTO mysql_query_rules (rule_id, active, match_pattern, replace_pattern, apply, destination_hostgroup, comment)"
+		" VALUES (42, 1, ';min_gtid=[\\:\\-\\w]+', '', 1, %d, 'Remove min_gtid annotation and route to dedicated HG')",
+		DEDICATED_HG);
+	MYSQL_QUERY_T(admin, rule_query);
 	MYSQL_QUERY_T(admin, "LOAD MYSQL QUERY RULES TO RUNTIME");
 
 	MYSQL_QUERY_T(admin, "SET mysql-query_processor_first_comment_parsing = 1");
@@ -49,6 +70,12 @@ static int cleanup(MYSQL* admin) {
 	MYSQL_QUERY_T(admin, "LOAD MYSQL QUERY RULES TO RUNTIME");
 	MYSQL_QUERY_T(admin, "SET mysql-query_processor_first_comment_parsing = 2");
 	MYSQL_QUERY_T(admin, "LOAD MYSQL VARIABLES TO RUNTIME");
+
+	char del_query[256];
+	snprintf(del_query, sizeof(del_query),
+		"DELETE FROM mysql_servers WHERE hostgroup_id=%d", DEDICATED_HG);
+	MYSQL_QUERY_T(admin, del_query);
+	MYSQL_QUERY_T(admin, "LOAD MYSQL SERVERS TO RUNTIME");
 }
 
 static std::string strip_dashes(const std::string& uuid) {
@@ -145,18 +172,26 @@ static int parse_gtid_executed_max(const std::string& gtid_executed, std::string
 	return 0;
 }
 
-static int get_gtid_info(MYSQL* admin, std::string& server_uuid, uint64_t& max_trxid) {
-	MYSQL_QUERY_T(admin, "SELECT hostname, port, gtid_executed FROM stats.stats_mysql_gtid_executed WHERE gtid_executed IS NOT NULL AND gtid_executed != '' LIMIT 1");
+static int get_gtid_info(MYSQL* admin, const CommandLine& cl, std::string& server_uuid, uint64_t& max_trxid) {
+	char query[512];
+	snprintf(query, sizeof(query),
+		"SELECT hostname, port, gtid_executed FROM stats.stats_mysql_gtid_executed"
+		" WHERE hostname='%s' AND port=%d AND gtid_executed IS NOT NULL AND gtid_executed != ''",
+		cl.mysql_host, cl.mysql_port);
+
+	MYSQL_QUERY_T(admin, query);
 	MYSQL_RES* res = mysql_store_result(admin);
 	if (!res) return -1;
 
 	MYSQL_ROW row = mysql_fetch_row(res);
 	if (!row || !row[2]) {
 		mysql_free_result(res);
+		diag("No GTID info for backend %s:%d", cl.mysql_host, cl.mysql_port);
 		return -1;
 	}
 
 	std::string gtid_executed = row[2];
+	diag("Using GTID from backend %s:%d: %s", cl.mysql_host, cl.mysql_port, gtid_executed.c_str());
 	mysql_free_result(res);
 
 	return parse_gtid_executed_max(gtid_executed, server_uuid, max_trxid);
@@ -364,14 +399,15 @@ int main(int, char**) {
 		return exit_status();
 	}
 
-	setup(admin, proxy);
+	setup(admin, proxy, cl);
 
 	std::string server_uuid;
 	uint64_t max_trxid = 0;
-	if (get_gtid_info(admin, server_uuid, max_trxid) != 0) {
+	if (get_gtid_info(admin, cl, server_uuid, max_trxid) != 0) {
 		mysql_close(proxy);
 		mysql_close(admin);
-		BAIL_OUT("No GTID info available from stats.stats_mysql_gtid_executed");
+		BAIL_OUT("No GTID info available from stats.stats_mysql_gtid_executed for backend %s:%d",
+			cl.mysql_host, cl.mysql_port);
 	}
 
 	std::string current_gtid = server_uuid + ":" + std::to_string(max_trxid);
