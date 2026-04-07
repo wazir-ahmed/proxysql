@@ -19,7 +19,6 @@
 #include <cstring>
 #include <cstdint>
 #include <string>
-#include <map>
 #include "mysql.h"
 #include "tap.h"
 #include "command_line.h"
@@ -50,7 +49,8 @@ static int setup(MYSQL* admin, MYSQL* proxy, const CommandLine& cl) {
 	MYSQL_QUERY_T(admin, server_query);
 	MYSQL_QUERY_T(admin, "LOAD MYSQL SERVERS TO RUNTIME");
 
-	MYSQL_QUERY_T(admin, "DELETE FROM mysql_query_rules");
+	// Only insert/replace rule 42 — do NOT delete all existing rules.
+	MYSQL_QUERY_T(admin, "DELETE FROM mysql_query_rules WHERE rule_id=42");
 	char rule_query[1024];
 	snprintf(rule_query, sizeof(rule_query),
 		"INSERT INTO mysql_query_rules (rule_id, active, match_pattern, replace_pattern, apply, destination_hostgroup, comment)"
@@ -61,9 +61,11 @@ static int setup(MYSQL* admin, MYSQL* proxy, const CommandLine& cl) {
 
 	MYSQL_QUERY_T(admin, "SET mysql-query_processor_first_comment_parsing = 1");
 	MYSQL_QUERY_T(admin, "LOAD MYSQL VARIABLES TO RUNTIME");
+
+	return 0;
 }
 
-static int cleanup(MYSQL* admin) {
+static int cleanup(MYSQL* admin, MYSQL* proxy) {
 	diag("========== Teardown ==========");
 
 	MYSQL_QUERY_T(admin, "DELETE FROM mysql_query_rules WHERE rule_id=42");
@@ -76,6 +78,10 @@ static int cleanup(MYSQL* admin) {
 		"DELETE FROM mysql_servers WHERE hostgroup_id=%d", DEDICATED_HG);
 	MYSQL_QUERY_T(admin, del_query);
 	MYSQL_QUERY_T(admin, "LOAD MYSQL SERVERS TO RUNTIME");
+
+	MYSQL_QUERY_T(proxy, "DROP TABLE IF EXISTS test.ps_min_gtid_fc");
+
+	return 0;
 }
 
 static std::string strip_dashes(const std::string& uuid) {
@@ -99,10 +105,29 @@ static bool parse_interval_token(const std::string& token, uint64_t& interval_en
 	return true;
 }
 
-static int parse_gtid_executed_max(const std::string& gtid_executed, std::string& server_uuid, uint64_t& max_trxid) {
-	if (gtid_executed.empty()) return -1;
+/**
+ * @brief Trim leading and trailing whitespace from a string.
+ */
+static std::string trim(const std::string& s) {
+	size_t start = s.find_first_not_of(" \t\n\r");
+	if (start == std::string::npos) return "";
+	size_t end = s.find_last_not_of(" \t\n\r");
+	return s.substr(start, end - start + 1);
+}
 
-	std::map<std::string, uint64_t> uuid_to_max;
+/**
+ * @brief Parse gtid_executed and extract the max trxid for a specific target UUID.
+ * @param gtid_executed  The full gtid_executed string from the backend.
+ * @param target_uuid    The backend's own server_uuid (dash-stripped) to look up.
+ * @param max_trxid      Output: the maximum transaction ID for that UUID.
+ * @return 0 on success, -1 if target_uuid not found.
+ */
+static int parse_gtid_executed_for_uuid(const std::string& gtid_executed_raw, const std::string& target_uuid, uint64_t& max_trxid) {
+	std::string gtid_executed = trim(gtid_executed_raw);
+	if (gtid_executed.empty() || target_uuid.empty()) return -1;
+
+	max_trxid = 0;
+	bool found = false;
 
 	size_t pos = 0;
 	while (pos < gtid_executed.size()) {
@@ -111,21 +136,20 @@ static int parse_gtid_executed_max(const std::string& gtid_executed, std::string
 			? gtid_executed.substr(pos)
 			: gtid_executed.substr(pos, comma_pos - pos);
 
+		group = trim(group);
 		size_t colon_pos = group.find(':');
 		if (colon_pos == std::string::npos || colon_pos == 0) {
-			return -1;
+			pos = (comma_pos == std::string::npos) ? std::string::npos : comma_pos + 1;
+			continue;
 		}
 
 		std::string uuid = strip_dashes(group.substr(0, colon_pos));
-		std::string intervals_str = group.substr(colon_pos + 1);
-
-		if (uuid.empty() || intervals_str.empty()) {
-			return -1;
+		if (uuid != target_uuid) {
+			pos = (comma_pos == std::string::npos) ? std::string::npos : comma_pos + 1;
+			continue;
 		}
 
-		uint64_t group_max = 0;
-		bool group_valid = false;
-
+		std::string intervals_str = group.substr(colon_pos + 1);
 		size_t ipos = 0;
 		while (ipos < intervals_str.size()) {
 			size_t next_colon = intervals_str.find(':', ipos);
@@ -136,43 +160,50 @@ static int parse_gtid_executed_max(const std::string& gtid_executed, std::string
 			if (!token.empty()) {
 				uint64_t interval_end = 0;
 				if (parse_interval_token(token, interval_end)) {
-					if (!group_valid || interval_end > group_max) {
-						group_max = interval_end;
+					if (interval_end > max_trxid) {
+						max_trxid = interval_end;
 					}
-					group_valid = true;
+					found = true;
 				}
 			}
 
 			ipos = (next_colon == std::string::npos) ? std::string::npos : next_colon + 1;
 		}
 
-		if (group_valid) {
-			auto it = uuid_to_max.find(uuid);
-			if (it == uuid_to_max.end() || group_max > it->second) {
-				uuid_to_max[uuid] = group_max;
-			}
-		}
-
 		pos = (comma_pos == std::string::npos) ? std::string::npos : comma_pos + 1;
 	}
 
-	if (uuid_to_max.empty()) return -1;
+	return found ? 0 : -1;
+}
 
-	uint64_t best_max = 0;
-	std::string best_uuid;
-	for (const auto& entry : uuid_to_max) {
-		if (entry.second > best_max || (entry.second == best_max && (best_uuid.empty() || entry.first < best_uuid))) {
-			best_max = entry.second;
-			best_uuid = entry.first;
-		}
+/**
+ * @brief Query the backend's own @@server_uuid through the proxy connection.
+ */
+static int get_backend_server_uuid(MYSQL* proxy, std::string& uuid_out) {
+	MYSQL_QUERY_T(proxy, "SELECT @@server_uuid");
+	MYSQL_RES* res = mysql_store_result(proxy);
+	if (!res) return -1;
+
+	MYSQL_ROW row = mysql_fetch_row(res);
+	if (!row || !row[0]) {
+		mysql_free_result(res);
+		return -1;
 	}
 
-	server_uuid = best_uuid;
-	max_trxid = best_max;
+	uuid_out = strip_dashes(row[0]);
+	diag("Backend @@server_uuid (stripped): %s", uuid_out.c_str());
+	mysql_free_result(res);
 	return 0;
 }
 
-static int get_gtid_info(MYSQL* admin, const CommandLine& cl, std::string& server_uuid, uint64_t& max_trxid) {
+static int get_gtid_info(MYSQL* admin, MYSQL* proxy, const CommandLine& cl, std::string& server_uuid, uint64_t& max_trxid) {
+	// Get the backend's own server_uuid so we look up the correct UUID
+	// in gtid_executed (avoiding picking a replicated UUID from another source).
+	if (get_backend_server_uuid(proxy, server_uuid) != 0) {
+		diag("Failed to query @@server_uuid from backend");
+		return -1;
+	}
+
 	char query[512];
 	snprintf(query, sizeof(query),
 		"SELECT hostname, port, gtid_executed FROM stats.stats_mysql_gtid_executed"
@@ -194,13 +225,24 @@ static int get_gtid_info(MYSQL* admin, const CommandLine& cl, std::string& serve
 	diag("Using GTID from backend %s:%d: %s", cl.mysql_host, cl.mysql_port, gtid_executed.c_str());
 	mysql_free_result(res);
 
-	return parse_gtid_executed_max(gtid_executed, server_uuid, max_trxid);
+	return parse_gtid_executed_for_uuid(gtid_executed, server_uuid, max_trxid);
 }
 
-static int check_ps_cache(MYSQL* admin, const char* pattern, std::string& query_text, long& global_stmt_id) {
-	std::string q = "SELECT global_stmt_id, query FROM stats.stats_mysql_prepared_statements_info WHERE query LIKE '%";
-	q += pattern;
-	q += "%'";
+/**
+ * @brief The expected rewritten query text after rule 42 strips the min_gtid annotation.
+ *
+ * check_ps_cache() uses an exact match against this string to avoid picking up
+ * stale entries from prior test runs. The stats_mysql_prepared_statements_info
+ * table has no hostgroup column, so exact-match + schemaname is the most
+ * reliable filter available.
+ */
+static const char* EXPECTED_PS_QUERY = "SELECT id FROM test.ps_min_gtid_fc WHERE id=?";
+
+static int check_ps_cache(MYSQL* admin, std::string& query_text, long& global_stmt_id) {
+	std::string q = "SELECT global_stmt_id, query FROM stats.stats_mysql_prepared_statements_info"
+		" WHERE schemaname='test' AND query='";
+	q += EXPECTED_PS_QUERY;
+	q += "' LIMIT 1";
 
 	MYSQL_QUERY_T(admin, q.c_str());
 	MYSQL_RES* res = mysql_store_result(admin);
@@ -293,7 +335,7 @@ static long test_prepare_stmt_valid_gtid(MYSQL* admin, MYSQL* proxy, const std::
 
 	std::string query_text_a;
 	long global_stmt_id_a = 0;
-	if (check_ps_cache(admin, "test.ps_min_gtid_fc", query_text_a, global_stmt_id_a) == 0) {
+	if (check_ps_cache(admin, query_text_a, global_stmt_id_a) == 0) {
 		ok(query_text_a.find("min_gtid=") == std::string::npos,
 		   "test_valid_gtid: Cached query should not contain min_gtid annotation (rewritten): %s", query_text_a.c_str());
 	} else {
@@ -358,7 +400,7 @@ static void test_prepare_stmt_future_gtid(MYSQL* admin, MYSQL* proxy, const std:
 
 	std::string query_text_b;
 	long global_stmt_id_b = 0;
-	if (check_ps_cache(admin, "test.ps_min_gtid_fc", query_text_b, global_stmt_id_b) == 0) {
+	if (check_ps_cache(admin, query_text_b, global_stmt_id_b) == 0) {
 		ok(query_text_b.find("min_gtid=") == std::string::npos,
 		   "test_future_gtid: Cached query should not contain min_gtid annotation (rewritten): %s", query_text_b.c_str());
 	} else {
@@ -403,7 +445,7 @@ int main(int, char**) {
 
 	std::string server_uuid;
 	uint64_t max_trxid = 0;
-	if (get_gtid_info(admin, cl, server_uuid, max_trxid) != 0) {
+	if (get_gtid_info(admin, proxy, cl, server_uuid, max_trxid) != 0) {
 		mysql_close(proxy);
 		mysql_close(admin);
 		BAIL_OUT("No GTID info available from stats.stats_mysql_gtid_executed for backend %s:%d",
@@ -418,7 +460,7 @@ int main(int, char**) {
 	long global_stmt_id_a = test_prepare_stmt_valid_gtid(admin, proxy, current_gtid);
 	test_prepare_stmt_future_gtid(admin, proxy, future_gtid, global_stmt_id_a);
 
-	cleanup(admin);
+	cleanup(admin, proxy);
 
 	mysql_close(proxy);
 	mysql_close(admin);
