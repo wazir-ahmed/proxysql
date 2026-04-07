@@ -2,11 +2,14 @@
  * @file test_binlog_reader_uses_previous_hostgroup-t.cpp
  * @brief Test binlog reader uses the hostgroup of the previous COM_QUERY.
  * @details When a COM_REGISTER_SLAVE command is received, test that ProxySQL
- * will automatically switch from not fast_forward mode to fast_forward mode.
- * It also test that the destination hostgroup assigned from previous COM_QUERY
- * commands is the one used to establish the fast_forward connection. To test
- * this we look at how many connections are closed in the hostgroup that should
- * have been used for the fast_forward connections.
+ *   will automatically switch from not fast_forward mode to fast_forward mode.
+ *   It also tests that the destination hostgroup assigned from previous
+ *   COM_QUERY commands is the one used to establish the fast_forward connection.
+ *   To test this we look at how many connections are closed in the hostgroup
+ *   that should have been used for the fast_forward connections.
+ *
+ *   Uses a native in-tree helper (via MARIADB_RPL) instead of the former
+ *   external test_binlog_reader-t binary.
  */
 
 #include <unistd.h>
@@ -18,6 +21,7 @@
 #include "command_line.h"
 #include "utils.h"
 #include "tap.h"
+#include "native_test_binlog_reader.h"
 
 using std::vector;
 using std::string;
@@ -105,10 +109,9 @@ int main(int argc, char** argv) {
 	}
 	const long conn_closed_before = std::stol(hg_stats_row[0]);
 
-	const char * tdp = getenv("TEST_DEPS");
-	const std::string test_binlog_reader = ( tdp == nullptr || *tdp == '\0' ) ? "./test_binlog_reader-t" : std::string(tdp) + "/test_binlog_reader-t";
-	const int test_binlog_reader_res = system(test_binlog_reader.c_str());
+	const int test_binlog_reader_res = run_native_test_binlog_reader(cl);
 	if (test_binlog_reader_res) {
+		diag("Native test_binlog_reader failed with exit code: %d", test_binlog_reader_res);
 		mysql_close(proxy_admin);
 		return EXIT_FAILURE;
 	}
