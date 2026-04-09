@@ -426,7 +426,7 @@ int main(int, char**) {
 		return -1;
 	}
 
-	plan(6);
+	plan(7);
 
 	MYSQL* admin = init_mysql_conn(cl.host, cl.admin_port, cl.admin_username, cl.admin_password);
 	if (!admin) {
@@ -460,10 +460,24 @@ int main(int, char**) {
 	diag("Current GTID: %s", current_gtid.c_str());
 	diag("Future GTID:  %s", future_gtid.c_str());
 	long global_stmt_id_a = test_prepare_stmt_valid_gtid(admin, proxy, current_gtid);
-	test_prepare_stmt_future_gtid(admin, proxy, future_gtid, global_stmt_id_a);
+
+	// Test 2 needs a fresh proxy connection so ProxySQL must acquire a new
+	// backend connection and go through the GTID check.  If we reuse the
+	// same session, the already-attached backend connection is reused and
+	// the min_gtid constraint is never evaluated.
+	MYSQL* proxy2 = init_mysql_conn(cl.host, cl.port, cl.username, cl.password);
+	if (!proxy2) {
+		mysql_close(proxy);
+		mysql_close(admin);
+		BAIL_OUT("Failed to create proxy2 connection for test_future_gtid");
+	}
+	MYSQL_QUERY_T(proxy2, "USE test");
+
+	test_prepare_stmt_future_gtid(admin, proxy2, future_gtid, global_stmt_id_a);
 
 	cleanup(admin, proxy);
 
+	mysql_close(proxy2);
 	mysql_close(proxy);
 	mysql_close(admin);
 
