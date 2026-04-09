@@ -54,7 +54,7 @@ static int setup(MYSQL* admin, MYSQL* proxy, const CommandLine& cl) {
 	char rule_query[1024];
 	snprintf(rule_query, sizeof(rule_query),
 		"INSERT INTO mysql_query_rules (rule_id, active, match_pattern, replace_pattern, apply, destination_hostgroup, comment)"
-		" VALUES (42, 1, ';min_gtid=[\\:\\-\\w]+', '', 1, %d, 'Remove min_gtid annotation and route to dedicated HG')",
+		" VALUES (42, 1, ';min_gtid=[:\\-\\w]+', '', 1, %d, 'Remove min_gtid annotation and route to dedicated HG')",
 		DEDICATED_HG);
 	MYSQL_QUERY_T(admin, rule_query);
 	MYSQL_QUERY_T(admin, "LOAD MYSQL QUERY RULES TO RUNTIME");
@@ -236,7 +236,7 @@ static int get_gtid_info(MYSQL* admin, MYSQL* proxy, const CommandLine& cl, std:
  * table has no hostgroup column, so exact-match + schemaname is the most
  * reliable filter available.
  */
-static const char* EXPECTED_PS_QUERY = "SELECT id FROM test.ps_min_gtid_fc WHERE id=?";
+static const char* EXPECTED_PS_QUERY = "/*+  */ SELECT id FROM test.ps_min_gtid_fc WHERE id=?";
 
 static int check_ps_cache(MYSQL* admin, std::string& query_text, long& global_stmt_id) {
 	std::string q = "SELECT global_stmt_id, query FROM stats.stats_mysql_prepared_statements_info"
@@ -440,6 +440,8 @@ int main(int, char**) {
 		mysql_close(admin);
 		return exit_status();
 	}
+
+	MYSQL_QUERY_T(proxy, "USE test");
 
 	setup(admin, proxy, cl);
 
