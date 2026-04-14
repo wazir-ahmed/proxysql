@@ -5955,7 +5955,10 @@ void * monitor_AWS_Aurora_thread_HG(void *arg) {
 	unsigned int add_lag_ms = 0;
 	unsigned int min_lag_ms = 0;
 	unsigned int lag_num_checks = 1;
+	unsigned int autopurge_missing_checks = 0;
 	//unsigned int i = 0;
+	// Map to track consecutive absences of servers from REPLICA_HOST_STATUS (issue #5547)
+	std::map<std::string, int> server_absence_counter;
 	set_thread_name("MonitorAuroraHG", GloVars.set_thread_name);
 	proxy_info("Started Monitor thread for AWS Aurora writer HG %u\n", wHG);
 
@@ -5999,6 +6002,7 @@ void * monitor_AWS_Aurora_thread_HG(void *arg) {
 			add_lag_ms = atoi(r->fields[8]);
 			min_lag_ms = atoi(r->fields[9]);
 			lag_num_checks = atoi(r->fields[10]);
+			autopurge_missing_checks = atoi(r->fields[11]);
 		}
 	}
 	host_def_t *hpa = (host_def_t *)malloc(sizeof(host_def_t)*num_hosts);
@@ -6301,6 +6305,81 @@ __exit_monitor_aws_aurora_HG_thread:
 			}
 			lasts_ase[ase_idx] = ase_l;
 			GloMyMon->evaluate_aws_aurora_results(wHG, rHG, &lasts_ase[0], ase_idx, max_lag_ms, add_lag_ms, min_lag_ms, lag_num_checks);
+
+			// Issue #5547: Auto-purge servers that disappear from REPLICA_HOST_STATUS
+			// Only process if autopurge is enabled and query was successful with results
+			if (autopurge_missing_checks > 0 && mmsd->interr == 0 && ase->host_statuses->size() > 0) {
+				// Build set of server_ids from the Aurora result
+				std::set<std::string> present_servers;
+				for (auto h : *(ase->host_statuses)) {
+					present_servers.insert(h->server_id);
+				}
+
+				// Check servers in writer hostgroup
+				MyHGC *whgc = MyHGM->MyHGC_lookup(wHG);
+				if (whgc && whgc->mysrvs) {
+					for (unsigned int j = 0; j < whgc->mysrvs->cnt(); j++) {
+						MySrvC *mysrvc = whgc->mysrvs->idx(j);
+						if (mysrvc->get_status() == MYSQL_SERVER_STATUS_OFFLINE_HARD) continue;
+
+						// Construct server_id from hostname (remove domain suffix if present)
+						std::string server_id(mysrvc->address);
+						size_t dot_pos = server_id.find('.');
+						if (dot_pos != std::string::npos) {
+							server_id = server_id.substr(0, dot_pos);
+						}
+
+						std::string srv_key = std::to_string(wHG) + ":" + server_id;
+						if (present_servers.find(server_id) == present_servers.end()) {
+							// Server not in REPLICA_HOST_STATUS - increment absence counter
+							server_absence_counter[srv_key]++;
+							if (server_absence_counter[srv_key] >= (int)autopurge_missing_checks) {
+								proxy_warning("Auto-purging server %s:%d from hostgroup %u (absent from REPLICA_HOST_STATUS for %d checks)\n",
+									mysrvc->address, mysrvc->port, wHG, server_absence_counter[srv_key]);
+								MyHGM->remove_server_in_hg(wHG, mysrvc->address, mysrvc->port);
+								server_absence_counter.erase(srv_key);
+							}
+						} else {
+							// Server is present - reset counter
+							server_absence_counter.erase(srv_key);
+						}
+					}
+				}
+
+				// Check servers in reader hostgroup
+				if (rHG > 0) {
+					MyHGC *rhgc = MyHGM->MyHGC_lookup(rHG);
+					if (rhgc && rhgc->mysrvs) {
+						for (unsigned int j = 0; j < rhgc->mysrvs->cnt(); j++) {
+							MySrvC *mysrvc = rhgc->mysrvs->idx(j);
+							if (mysrvc->get_status() == MYSQL_SERVER_STATUS_OFFLINE_HARD) continue;
+
+							// Construct server_id from hostname (remove domain suffix if present)
+							std::string server_id(mysrvc->address);
+							size_t dot_pos = server_id.find('.');
+							if (dot_pos != std::string::npos) {
+								server_id = server_id.substr(0, dot_pos);
+							}
+
+							std::string srv_key = std::to_string(rHG) + ":" + server_id;
+							if (present_servers.find(server_id) == present_servers.end()) {
+								// Server not in REPLICA_HOST_STATUS - increment absence counter
+								server_absence_counter[srv_key]++;
+								if (server_absence_counter[srv_key] >= (int)autopurge_missing_checks) {
+									proxy_warning("Auto-purging server %s:%d from hostgroup %u (absent from REPLICA_HOST_STATUS for %d checks)\n",
+										mysrvc->address, mysrvc->port, rHG, server_absence_counter[srv_key]);
+									MyHGM->remove_server_in_hg(rHG, mysrvc->address, mysrvc->port);
+									server_absence_counter.erase(srv_key);
+								}
+							} else {
+								// Server is present - reset counter
+								server_absence_counter.erase(srv_key);
+							}
+						}
+					}
+				}
+			}
+
 			for (auto h : *(ase_l->host_statuses)) {
 				for (auto h2 : *(ase->host_statuses)) {
 					if (strcmp(h2->server_id, h->server_id) == 0) {

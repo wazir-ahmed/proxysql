@@ -3739,12 +3739,18 @@ bool MySQL_HostGroups_Manager::shun_and_killall(char *hostname, int port) {
 					// set too high, ProxySQL will unshun hosts that are not
 					// available. For this reason time_last_detected_error will
 					// be tuned in the future
+					//
+					// Fix for issue #5546: Add safety margin to prevent race condition
+					// where server can be unshunned before next ping arrives.
+					// Using 2 * ping_interval provides buffer for scheduling delays.
 					if (mysql_thread___monitor_enabled) {
 						int a = mysql_thread___shun_recovery_time_sec;
 						int b = mysql_thread___monitor_ping_interval;
 						b = b/1000;
 						if (b > a) {
-							t = t + (b - a);
+							// Add safety margin: ensure unshun window cannot open before
+							// next ping cycle has a chance to run (with buffer for delays)
+							t = t + (2 * b - a);
 						}
 					}
 					mysrvc->time_last_detected_error = t;
@@ -6792,7 +6798,7 @@ void MySQL_HostGroups_Manager::update_aws_aurora_set_reader(int _whid, int _rhid
 
 const char SELECT_AWS_AURORA_SERVERS_FOR_MONITOR[] {
 	"SELECT writer_hostgroup, reader_hostgroup, hostname, port, MAX(use_ssl) use_ssl, max_lag_ms, check_interval_ms,"
-		" check_timeout_ms, add_lag_ms, min_lag_ms, lag_num_checks FROM mysql_servers"
+		" check_timeout_ms, add_lag_ms, min_lag_ms, lag_num_checks, autopurge_missing_checks FROM mysql_servers"
 	" JOIN mysql_aws_aurora_hostgroups ON"
 		" hostgroup_id=writer_hostgroup OR hostgroup_id=reader_hostgroup WHERE active=1 AND status NOT IN (2,3)"
 	" GROUP BY writer_hostgroup, hostname, port"
