@@ -36,6 +36,22 @@ This will:
 **Note:** After rebuilding, restart your infrastructure with a fresh `INFRA_ID` to use the new binary.
 
 ---
+
+## 0.2. Simulator-backed TAP groups
+
+Groups whose name ends in `-sim-g<N>` (e.g. `aurora-sim-g1`, `galera-sim-g1`) drive ProxySQL via the in-repo `cluster_simulator` under `test/deps/cluster_simulator/`. The simulator mutates ProxySQL's internal cluster state through code paths gated by compile-time `#ifdef` flags, so the ProxySQL binary **must** be built with the matching flag or state mutations become no-ops and tests fail silently.
+
+| Simulator group     | Required build target     |
+|---------------------|---------------------------|
+| `aurora-sim-g<N>`   | `make testaurora`         |
+| `galera-sim-g<N>`   | `make testgalera`         |
+| `grouprep-sim-g<N>` | `make testgrouprep`       |
+| `readonly-sim-g<N>` | `make testreadonly`       |
+| `repl-sim-g<N>`     | `make testreplicationlag` |
+
+Each target sets the corresponding `-DTEST_<FAMILY>` flag on the ProxySQL src and lib build and triggers the simulator binary build. A plain `make` is **not sufficient** for these groups.
+
+---
 ## 1. Core Concepts
 
 The Unified CI system is designed around three pillars:
