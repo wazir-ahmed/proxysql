@@ -2,8 +2,8 @@
 # Aurora simulator TAP group environment
 
 export CLUSTER_SIM_BINARY_PATH="${WORKSPACE}/test/deps/cluster_simulator/cluster_simulator"
-export CLUSTER_SIM_TEST_PAYLOAD_PATH="${WORKSPACE}/test/deps/cluster_simulator/tests/aurora_tests_payloads"
-export CLUSTER_SIM_HOST_FILE="${WORKSPACE}/test/tap/groups/aurora-sim/add-hosts"
+export CLUSTER_SIM_TESTS_ROOT="${WORKSPACE}/test/deps/cluster_simulator/tests"
+export CLUSTER_SIM_HOST_FILE="${WORKSPACE}/test/tap/groups/cluster_sim_aurora/add-hosts"
 
 # Target ProxySQL's SQLite server via the docker-network alias; defaults for
 # username/password match what enable_aurora_testing() inserts.

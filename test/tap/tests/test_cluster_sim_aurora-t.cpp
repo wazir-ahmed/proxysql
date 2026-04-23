@@ -1,13 +1,16 @@
 /**
- * @file test_sim_aurora_cluster-t.cpp
- * @brief TAP wrapper that drives the in-repo cluster_simulator against Aurora
- *   payloads. One TAP point is emitted per .json payload under
- *   CLUSTER_SIM_TEST_PAYLOAD_PATH, using `cluster_simulator --mode verify -f`.
+ * @file test_cluster_sim_aurora-t.cpp
+ * @brief TAP wrapper that drives the in-repo cluster_simulator against one
+ *   family's payload directory: one TAP point per .json file via
+ *   `cluster_simulator --mode verify -f`.
  *
- *   The wrapper deliberately does not link against cluster_simulator_lib.a;
- *   the small helpers it needs (error shaping, JSON-state sorting) are inlined
- *   below so it fits the generic %-t pattern rule in test/tap/tests/Makefile.
+ *   Each family has its own wrapper that differs only in `kPayloadSubdir`;
+ *   the rest is identical. The wrapper deliberately does not link against
+ *   cluster_simulator_lib.a — the small helpers it needs are inlined.
  */
+
+// Subdirectory under CLUSTER_SIM_TESTS_ROOT containing this family's payloads.
+static constexpr const char* kPayloadSubdir = "aurora_tests_payloads";
 
 #include <algorithm>
 #include <cstdlib>
@@ -192,12 +195,12 @@ int main(int, const char*[]) {
 	}
 	const std::string sim_path { c_sim_path };
 
-	const char* c_payload_path = std::getenv("CLUSTER_SIM_TEST_PAYLOAD_PATH");
-	if (c_payload_path == nullptr || *c_payload_path == '\0') {
-		diag("CLUSTER_SIM_TEST_PAYLOAD_PATH env var is required");
+	const char* c_tests_root = std::getenv("CLUSTER_SIM_TESTS_ROOT");
+	if (c_tests_root == nullptr || *c_tests_root == '\0') {
+		diag("CLUSTER_SIM_TESTS_ROOT env var is required");
 		return EXIT_FAILURE;
 	}
-	const std::string tests_path { c_payload_path };
+	const std::string tests_path = std::string { c_tests_root } + "/" + kPayloadSubdir;
 
 	const std::vector<std::string> payload_files = get_test_files(tests_path);
 	if (payload_files.empty()) {
