@@ -2086,32 +2086,41 @@ std::pair<int, std::string> get_cmd_options(
 	return err_res;
 }
 
-// TODO: This shouldn't be hardcoded
-// //////////////////////////////////////////////
-const std::string galera_hostname { "127.1.1.11" };
-const std::string galera_username { "galera1" };
-const std::string galera_pass { "pass1" };
-const int galera_port = 3306;
+// Per-family SQLiteServer endpoints — env var overrides with legacy defaults.
+static std::string env_or(const char* name, const std::string& def) {
+	const char* v = std::getenv(name);
+	return (v != nullptr && *v != '\0') ? std::string { v } : def;
+}
+static int env_or(const char* name, int def) {
+	const char* v = std::getenv(name);
+	if (v == nullptr || *v == '\0') { return def; }
+	try { return std::stoi(v); } catch (const std::exception&) { return def; }
+}
 
-const std::string readonly_hostname { "127.0.0.1" };
-const std::string readonly_username { "root" };
-const std::string readonly_pass { "root" };
-const int readonly_port = 3306;
+const std::string galera_hostname { env_or("GALERA_HOSTNAME", "127.1.1.11") };
+const std::string galera_username { env_or("GALERA_USERNAME", "galera1") };
+const std::string galera_pass { env_or("GALERA_PASSWORD", "pass1") };
+const int galera_port = env_or("GALERA_PORT", 3306);
 
-const std::string grouprep_hostname { "127.2.1.1" };
-const std::string grouprep_username { "grouprep1" };
-const std::string grouprep_pass { "pass1" };
-const int grouprep_port = 3306;
+const std::string readonly_hostname { env_or("READONLY_HOSTNAME", "127.0.0.1") };
+const std::string readonly_username { env_or("READONLY_USERNAME", "root") };
+const std::string readonly_pass { env_or("READONLY_PASSWORD", "root") };
+const int readonly_port = env_or("READONLY_PORT", 3306);
 
-const std::string replicationlag_hostname{ "127.0.0.1" };
-const std::string replicationlag_username{ "root" };
-const std::string replicationlag_pass{ "root" };
-const int replicationlag_port = 3306;
+const std::string grouprep_hostname { env_or("GROUPREP_HOSTNAME", "127.2.1.1") };
+const std::string grouprep_username { env_or("GROUPREP_USERNAME", "grouprep1") };
+const std::string grouprep_pass { env_or("GROUPREP_PASSWORD", "pass1") };
+const int grouprep_port = env_or("GROUPREP_PORT", 3306);
 
-const std::string aws_aurora_hostname { "127.0.1.11" };
-const std::string aws_aurora_username { "aurora1" };
-const std::string aws_aurora_pass { "pass1" };
-const int aws_aurora_port = 3306;
+const std::string replicationlag_hostname { env_or("REPL_LAG_HOSTNAME", "127.0.0.1") };
+const std::string replicationlag_username { env_or("REPL_LAG_USERNAME", "root") };
+const std::string replicationlag_pass { env_or("REPL_LAG_PASSWORD", "root") };
+const int replicationlag_port = env_or("REPL_LAG_PORT", 3306);
+
+const std::string aws_aurora_hostname { env_or("AURORA_HOSTNAME", "127.0.1.11") };
+const std::string aws_aurora_username { env_or("AURORA_USERNAME", "aurora1") };
+const std::string aws_aurora_pass { env_or("AURORA_PASSWORD", "pass1") };
+const int aws_aurora_port = env_or("AURORA_PORT", 3306);
 
 // //////////////////////////////////////////////
 
