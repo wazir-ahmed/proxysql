@@ -5,9 +5,9 @@ INSERT OR REPLACE INTO mysql_users (username, password, default_hostgroup, activ
 LOAD MYSQL USERS TO RUNTIME;
 SAVE MYSQL USERS TO DISK;
 
--- proxysql-ci.cnf pins sqliteserver-mysql_ifaces to 0.0.0.0:6030, overriding
--- TEST_REPLICATIONLAG's compiled-in default of 0.0.0.0:3306. Restore 0.0.0.0:3306
--- so the simulator (proxysql:3306 from the test-runner) can reach sqliteserver.
+-- When compiled with TEST_* flags (for cluster simulation), ProxySQL's monitoring
+-- reaches its own sqliteserver on :3306. The default proxysql-ci.cnf pins the server
+-- to :6030, so rebind it to :3306 here.
 SET sqliteserver-mysql_ifaces='0.0.0.0:3306';
 LOAD SQLITESERVER VARIABLES TO RUNTIME;
 SAVE SQLITESERVER VARIABLES TO DISK;

@@ -7,10 +7,9 @@ SAVE MYSQL SERVERS TO DISK;
 SAVE MYSQL VARIABLES FROM RUNTIME;
 SAVE MYSQL VARIABLES TO DISK;
 
--- proxysql-ci.cnf pins sqliteserver-mysql_ifaces to 0.0.0.0:6030, overriding
--- TEST_GROUPREP's compiled-in default of 127.2.1.{0..49}:3306. Bind 0.0.0.0:3306
--- so both the in-container GroupRep monitor and the simulator (proxysql:3306
--- from the test-runner) reach the same sqliteserver.
+-- When compiled with TEST_* flags (for cluster simulation), ProxySQL's monitoring
+-- reaches its own sqliteserver on :3306. The default proxysql-ci.cnf pins the server
+-- to :6030, so rebind it to :3306 here.
 SET sqliteserver-mysql_ifaces='0.0.0.0:3306';
 LOAD SQLITESERVER VARIABLES TO RUNTIME;
 SAVE SQLITESERVER VARIABLES TO DISK;
