@@ -8,7 +8,7 @@ export CLUSTER_SIM_HOST_FILE="${WORKSPACE}/test/tap/groups/aurora-sim/add-hosts"
 # Target ProxySQL's SQLite server via the docker-network alias; defaults for
 # username/password match what enable_aurora_testing() inserts.
 export AURORA_HOSTNAME=proxysql
-export AURORA_PORT=6030
+export AURORA_PORT=3306
 
 # Skip the background cluster nodes: they are built without TEST_AURORA and
 # their empty mysql_users sync back to the primary, wiping aurora1/2/3.
