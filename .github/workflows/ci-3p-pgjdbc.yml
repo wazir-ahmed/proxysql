@@ -51,7 +51,7 @@ jobs:
     - name: Checkout proxysql_3p_testing
       uses: actions/checkout@v4
       with:
-        repository: 'proxysql/proxysql_3p_testing'
+        repository: 'wazir-ahmed/proxysql_3p_testing'
         ref: ${{ env.TESTTREE }}
         fetch-depth: 1
         path: 'proxysql_3p_testing'
