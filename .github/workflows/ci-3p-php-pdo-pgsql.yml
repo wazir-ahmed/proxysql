@@ -135,14 +135,15 @@ jobs:
         GHUSER="$(id -u):$(id -g)"
         sudo chown -R ${GHUSER} ./logs
 
-        if ! ls ./logs/*/*_summary.log 1>/dev/null 2>&1; then
+        SUMMARY_LOGS=$(ls ./artifact/test/log/*_summary.log ./logs/*/*_summary.log 2>/dev/null)
+        if [[ -z "${SUMMARY_LOGS}" ]]; then
           echo "ERROR: No summary log found — tests likely did not run"
           exit 1
         fi
 
-        cat ./logs/*/*_summary.log
-        FAILS=$(cat ./logs/*/*_summary.log | grep -oP '(?<=^FAIL: )\d+')
-        ERRORS=$(cat ./logs/*/*_summary.log | grep -oP '(?<=^ERROR: )\d+')
+        cat ${SUMMARY_LOGS}
+        FAILS=$(cat ${SUMMARY_LOGS} | grep -oPm1 '(?<=^FAIL: )\d+')
+        ERRORS=$(cat ${SUMMARY_LOGS} | grep -oPm1 '(?<=^ERROR: )\d+')
 
         if [[ -z "${FAILS}" ]]; then
           echo "ERROR: Could not parse FAIL count from summary log"
@@ -159,13 +160,16 @@ jobs:
 
         echo "All tests passed"
 
+    - name: Set short SHA
+      if: ${{ !cancelled() }}
+      run: echo "SHORT_SHA=${SHA:0:7}" >> $GITHUB_ENV
     - name: Archive artifacts logs
       if: ${{ !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ github.workflow }}-${{ env.SHA }}-${{ matrix.infradb }}-${{ matrix.connector }}-logs-run#${{ github.run_number }}
+        name: ${{ github.workflow }}-run#${{ github.run_number }}-${{ env.SHORT_SHA }}-${{ matrix.infradb }}-${{ matrix.connector }}
         path: |
-          proxysql_3p_testing/test_${{ env.TESTNAME }}/logs
+          proxysql_3p_testing/test_${{ env.TESTNAME }}/artifact
           
     - uses: LouisBrunner/checks-action@v2.0.0
       if: always()
