@@ -87,6 +87,7 @@ jobs:
     - name: Unpack bin cache
       run: |
         command -v zstd >/dev/null || sudo apt-get install -y zstd
+        mkdir -p proxysql
         cd proxysql/
         zstd -d < ../cache_bin.tar.zst | tar -xf -
         rm ../cache_bin.tar.zst
