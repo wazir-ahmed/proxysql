@@ -640,6 +640,7 @@ class MySQL_Monitor {
 	void * monitor_galera();
 	void * monitor_aws_aurora();
 	void * monitor_aws_rds();
+	void * monitor_aws_rds_v2();
 	void * monitor_replication_lag();
 	void * monitor_dns_cache();
 	void * run();
@@ -730,5 +731,12 @@ private:
  * @return NULL on exit.
  */
 extern "C" void * monitor_AWS_RDS_thread_HG(void *arg);
+
+/**
+ * @brief Per-writer-hostgroup worker for the AWS RDS v2 monitor.
+ * @param arg pointer to the writer hostgroup id (unsigned int).
+ * @return NULL on exit.
+ */
+extern "C" void * monitor_AWS_RDS_v2_thread_HG(void *arg);
 
 #endif /* __CLASS_MYSQL_MONITOR_H */

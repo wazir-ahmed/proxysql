@@ -939,6 +939,13 @@ void * monitor_aws_rds_pthread(void *arg) {
 	return NULL;
 }
 
+void * monitor_aws_rds_v2_pthread(void *arg) {
+	set_thread_name("MonitorRDSv2", GloVars.set_thread_name);
+	if (!wait_for_glo_mth()) return NULL;
+	GloMyMon->monitor_aws_rds_v2();
+	return NULL;
+}
+
 void * monitor_replication_lag_pthread(void *arg) {
 #ifndef NOJEM
 	bool cache=false;
@@ -6695,6 +6702,251 @@ void * MySQL_Monitor::monitor_aws_rds() {
 	}
 	workers.clear();
 
+	if (mysql_thr) {
+		delete mysql_thr;
+		mysql_thr = NULL;
+	}
+	return NULL;
+}
+
+// ----------------------------------------------------------------------------
+// AWS RDS v2 monitor
+//
+// One main thread (monitor_aws_rds_v2) spins a per-writer-hostgroup worker
+// (monitor_AWS_RDS_v2_thread_HG) for each writer HG present in the
+// mysql_aws_rds_hostgroups monitor resultset, mirroring the AWS Aurora monitor.
+// ----------------------------------------------------------------------------
+
+// One backend candidate for the per-HG topology probe.
+struct aws_rds_v2_host_def_t {
+	std::string host;
+	int port;
+	bool use_ssl;
+	int weight;
+};
+
+// Branch B — Multi-AZ DB Cluster auto-discovery & failover.
+// TODO (Phase 3): run read_only checks on the standard 3 instances, move them
+// between reader/writer HGs, keep manually-added replicas, honor
+// autopurge_missing_checks, and drop a cluster_endpoint source after discovery.
+static void aws_rds_v2_branch_multiaz_cluster(
+	unsigned int writer_hg, unsigned int reader_hg, const aws_rds_v2_host_def_t& source
+) {
+	proxy_info(
+		"AWS RDS v2: [writer HG %u, reader HG %u] Multi-AZ cluster branch (source %s:%d) - not yet implemented\n",
+		writer_hg, reader_hg, source.host.c_str(), source.port
+	);
+}
+
+// Branch A — Blue/Green deployment state machine (Single-AZ / Multi-AZ Instance).
+// TODO (Phase 4): states 1-4 - detect the deployment, derive green endpoints,
+// add green hosts at weight 0, swap weights on switchover start/complete, then
+// remove the green hosts.
+static void aws_rds_v2_branch_blue_green(
+	unsigned int writer_hg, unsigned int reader_hg, const aws_rds_v2_host_def_t& source
+) {
+	proxy_info(
+		"AWS RDS v2: [writer HG %u, reader HG %u] Blue/Green branch (source %s:%d) - not yet implemented\n",
+		writer_hg, reader_hg, source.host.c_str(), source.port
+	);
+}
+
+// Per-writer-hostgroup worker. Snapshots its hosts/config from the monitor
+// resultset, then on every check interval runs the common states 1-2 (probe
+// mysql.rds_topology and decide the topology type) and dispatches to the
+// matching branch. The topology probe itself is filled in by Phase 2 logic;
+// the branches by Phases 3-4.
+extern "C" void * monitor_AWS_RDS_v2_thread_HG(void *arg) {
+	unsigned int writer_hg = *(unsigned int *)arg;
+	set_thread_name("MonRDSv2HG", GloVars.set_thread_name);
+	if (!wait_for_glo_mth()) return NULL;
+
+	unsigned int vars_version;
+	MySQL_Thread * mysql_thr = new MySQL_Thread();
+	mysql_thr->curtime = monotonic_time();
+	vars_version = GloMTH->get_global_version();
+	mysql_thr->refresh_variables();
+
+	// Snapshot this writer HG's reader HG, timings and hosts from the resultset.
+	// Resultset columns: 0 writer_hg, 1 reader_hg, 2 hostname, 3 port, 4 use_ssl,
+	// 5 weight, 6 check_interval_ms, 7 check_timeout_ms, 8 writer_is_also_reader,
+	// 9 autopurge_missing_checks, 10 domain_name.
+	unsigned int reader_hg = 0;
+	int check_interval_ms = 1000;
+	int check_timeout_ms = 800;
+	uint64_t initial_checksum = 0;
+	std::vector<aws_rds_v2_host_def_t> hosts;
+	pthread_mutex_lock(&GloMyMon->aws_rds_v2_mutex);
+	initial_checksum = GloMyMon->AWS_RDS_v2_Hosts_resultset ? GloMyMon->AWS_RDS_v2_Hosts_resultset->raw_checksum() : 0;
+	if (GloMyMon->AWS_RDS_v2_Hosts_resultset) {
+		for (SQLite3_row * r : GloMyMon->AWS_RDS_v2_Hosts_resultset->rows) {
+			if ((unsigned int)atoi(r->fields[0]) != writer_hg) continue;
+			reader_hg = atoi(r->fields[1]);
+			check_interval_ms = atoi(r->fields[6]);
+			check_timeout_ms = atoi(r->fields[7]);
+			aws_rds_v2_host_def_t h;
+			h.host = r->fields[2];
+			h.port = atoi(r->fields[3]);
+			h.use_ssl = atoi(r->fields[4]);
+			h.weight = atoi(r->fields[5]);
+			hosts.push_back(h);
+		}
+	}
+	pthread_mutex_unlock(&GloMyMon->aws_rds_v2_mutex);
+	(void)check_timeout_ms; // used once the topology probe is implemented
+
+	proxy_info(
+		"Started Monitor thread for AWS RDS v2 writer HG %u (reader HG %u, %lu hosts)\n",
+		writer_hg, reader_hg, (unsigned long)hosts.size()
+	);
+
+	unsigned long long next_loop_at = 0;
+	while (GloMyMon->shutdown == false && mysql_thread___monitor_enabled == true) {
+		if (!GloMTH) break;
+
+		unsigned int glover = GloMTH->get_global_version();
+		if (vars_version < glover) {
+			vars_version = glover;
+			mysql_thr->refresh_variables();
+		}
+
+		// Exit if the monitor definition changed; the main thread respawns us.
+		pthread_mutex_lock(&GloMyMon->aws_rds_v2_mutex);
+		uint64_t cur_checksum = GloMyMon->AWS_RDS_v2_Hosts_resultset ? GloMyMon->AWS_RDS_v2_Hosts_resultset->raw_checksum() : 0;
+		pthread_mutex_unlock(&GloMyMon->aws_rds_v2_mutex);
+		if (cur_checksum != initial_checksum) {
+			proxy_info("Stopping Monitor thread for AWS RDS v2 writer HG %u (definition changed)\n", writer_hg);
+			break;
+		}
+
+		unsigned long long t1 = monotonic_time();
+		if (t1 < next_loop_at) {
+			usleep(std::min((unsigned long long)100000, next_loop_at - t1));
+			continue;
+		}
+		next_loop_at = t1 + (unsigned long long)check_interval_ms * 1000;
+
+		// --- Common states 1-2 ---
+		// 1. Candidate list: pingable hosts with weight > 0.
+		// 2. Pick a random source, probe mysql.rds_topology
+		//    (TABLE_EXISTS -> VERSION_CHECK -> fetch), then branch on
+		//    is_aws_rds_multi_az_db_cluster_topology().
+		std::vector<aws_rds_v2_host_def_t> candidates;
+		for (const auto& h : hosts) {
+			if (h.weight > 0) candidates.push_back(h);
+		}
+		if (candidates.empty()) {
+			proxy_warning("AWS RDS v2: [writer HG %u] no candidate hosts (weight>0) to probe\n", writer_hg);
+			continue;
+		}
+		// TODO (Phase 2): ping-filter candidates and pick a random pingable source.
+		const aws_rds_v2_host_def_t& source = candidates[0];
+
+		// TODO (Phase 2): probe topology and set is_multiaz_cluster from the result.
+		bool is_multiaz_cluster = false;
+		if (is_multiaz_cluster) {
+			aws_rds_v2_branch_multiaz_cluster(writer_hg, reader_hg, source);
+		} else {
+			aws_rds_v2_branch_blue_green(writer_hg, reader_hg, source);
+		}
+	}
+
+	if (mysql_thr) {
+		delete mysql_thr;
+		mysql_thr = NULL;
+	}
+	proxy_info("Stopped Monitor thread for AWS RDS v2 writer HG %u\n", writer_hg);
+	return NULL;
+}
+
+void * MySQL_Monitor::monitor_aws_rds_v2() {
+	if (!wait_for_glo_mth()) return NULL;
+	unsigned int vars_version;
+	MySQL_Thread * mysql_thr = new MySQL_Thread();
+	mysql_thr->curtime = monotonic_time();
+	vars_version = GloMTH->get_global_version();
+	mysql_thr->refresh_variables();
+
+	uint64_t last_raw_checksum = 0;
+	unsigned int *hgs_array = NULL;
+	pthread_t *pthreads_array = NULL;
+	unsigned int hgs_num = 0;
+
+	while (GloMyMon->shutdown == false && mysql_thread___monitor_enabled == true) {
+		if (!GloMTH) return NULL;	// quick exit during shutdown/restart
+
+		// if variables changed, refresh them
+		unsigned int glover = GloMTH->get_global_version();
+		if (vars_version < glover) {
+			vars_version = glover;
+			mysql_thr->refresh_variables();
+		}
+
+		// if the list of servers / HGs / options changed, retire and respawn workers
+		pthread_mutex_lock(&aws_rds_v2_mutex);
+		uint64_t new_raw_checksum = AWS_RDS_v2_Hosts_resultset ? AWS_RDS_v2_Hosts_resultset->raw_checksum() : 0;
+		pthread_mutex_unlock(&aws_rds_v2_mutex);
+
+		if (new_raw_checksum != last_raw_checksum) {
+			proxy_info("Detected new/changed definition for AWS RDS v2 monitoring\n");
+			last_raw_checksum = new_raw_checksum;
+			if (pthreads_array) {
+				// the running workers observe the checksum change and self-exit
+				for (unsigned int i=0; i < hgs_num; i++) {
+					pthread_join(pthreads_array[i], NULL);
+				}
+				free(pthreads_array);
+				free(hgs_array);
+				pthreads_array = NULL;
+				hgs_array = NULL;
+			}
+			hgs_num = 0;
+			pthread_mutex_lock(&aws_rds_v2_mutex);
+			unsigned int num_rows = AWS_RDS_v2_Hosts_resultset ? AWS_RDS_v2_Hosts_resultset->rows_count : 0;
+			if (num_rows) {
+				unsigned int *tmp_hgs_array = (unsigned int *)malloc(sizeof(unsigned int)*num_rows);
+				// collect the distinct writer HGs
+				for (std::vector<SQLite3_row *>::iterator it = AWS_RDS_v2_Hosts_resultset->rows.begin() ; it != AWS_RDS_v2_Hosts_resultset->rows.end(); ++it) {
+					SQLite3_row *r=*it;
+					unsigned int wHG = atoi(r->fields[0]);
+					bool found = false;
+					for (unsigned int i=0; i < hgs_num; i++) {
+						if (tmp_hgs_array[i] == wHG) { found = true; break; }
+					}
+					if (found == false) {
+						tmp_hgs_array[hgs_num] = wHG;
+						hgs_num++;
+					}
+				}
+				proxy_info("Activating Monitoring of %u AWS RDS v2 clusters\n", hgs_num);
+				hgs_array = (unsigned int *)malloc(sizeof(unsigned int)*hgs_num);
+				pthreads_array = (pthread_t *)malloc(sizeof(pthread_t)*hgs_num);
+				for (unsigned int i=0; i < hgs_num; i++) {
+					hgs_array[i] = tmp_hgs_array[i];
+					proxy_info("Starting Monitor thread for AWS RDS v2 writer HG %u\n", hgs_array[i]);
+					if (pthread_create(&pthreads_array[i], NULL, monitor_AWS_RDS_v2_thread_HG, &hgs_array[i]) != 0) {
+						// LCOV_EXCL_START
+						proxy_error("Thread creation\n");
+						assert(0);
+						// LCOV_EXCL_STOP
+					}
+				}
+				free(tmp_hgs_array);
+			}
+			pthread_mutex_unlock(&aws_rds_v2_mutex);
+		}
+
+		usleep(10000);
+	}
+
+	// shutdown: workers self-exit on GloMyMon->shutdown; join them
+	if (pthreads_array) {
+		for (unsigned int i=0; i < hgs_num; i++) {
+			pthread_join(pthreads_array[i], NULL);
+		}
+		free(pthreads_array);
+		free(hgs_array);
+	}
 	if (mysql_thr) {
 		delete mysql_thr;
 		mysql_thr = NULL;
