@@ -1142,6 +1142,9 @@ MySQL_Monitor::MySQL_Monitor() {
 	pthread_mutex_init(&aws_rds_mutex,NULL);
 	AWS_RDS_Hosts_resultset=NULL;
 	AWS_RDS_Hosts_resultset_checksum = 0;
+	pthread_mutex_init(&aws_rds_v2_mutex,NULL);
+	AWS_RDS_v2_Hosts_resultset=NULL;
+	AWS_RDS_v2_Hosts_resultset_checksum = 0;
 	shutdown=false;
 	monitor_enabled=true;	// default
 	// create new SQLite datatabase
@@ -1258,6 +1261,12 @@ MySQL_Monitor::~MySQL_Monitor() {
 	}
 
 	pthread_mutex_destroy(&aws_rds_mutex);
+
+	if (AWS_RDS_v2_Hosts_resultset) {
+		delete AWS_RDS_v2_Hosts_resultset;
+		AWS_RDS_v2_Hosts_resultset = nullptr;
+	}
+	pthread_mutex_destroy(&aws_rds_v2_mutex);
 };
 
 void MySQL_Monitor::p_update_metrics() {

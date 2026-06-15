@@ -64,6 +64,14 @@
 										  "autopurge_missing_checks INT NOT NULL CHECK (autopurge_missing_checks >= 0 AND autopurge_missing_checks <= 100) DEFAULT 0 , " \
 										  "comment VARCHAR , UNIQUE (reader_hostgroup))"
 
+#define MYHGM_MYSQL_AWS_RDS_HOSTGROUPS "CREATE TABLE mysql_aws_rds_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND reader_hostgroup>0) , " \
+										  "active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 1 , domain_name VARCHAR NOT NULL DEFAULT '' , " \
+										  "check_interval_ms INT NOT NULL CHECK (check_interval_ms >= 100 AND check_interval_ms <= 600000) DEFAULT 1000 , " \
+										  "check_timeout_ms INT NOT NULL CHECK (check_timeout_ms >= 80 AND check_timeout_ms <= 3000) DEFAULT 800 , " \
+										  "writer_is_also_reader INT CHECK (writer_is_also_reader IN (0,1)) NOT NULL DEFAULT 0 , " \
+										  "autopurge_missing_checks INT NOT NULL CHECK (autopurge_missing_checks >= 0 AND autopurge_missing_checks <= 100) DEFAULT 0 , " \
+										  "comment VARCHAR , UNIQUE (reader_hostgroup))"
+
 #define MYHGM_GEN_ADMIN_RUNTIME_SERVERS "SELECT hostgroup_id, hostname, port, gtid_port, CASE status WHEN 0 THEN \"ONLINE\" WHEN 1 THEN \"SHUNNED\" WHEN 2 THEN \"OFFLINE_SOFT\" WHEN 3 THEN \"OFFLINE_HARD\" WHEN 4 THEN \"SHUNNED\" END status, weight, compression, max_connections, max_replication_lag, use_ssl, max_latency_ms, comment FROM mysql_servers ORDER BY hostgroup_id, hostname, port"
 
 #define MYHGM_MYSQL_HOSTGROUP_ATTRIBUTES "CREATE TABLE mysql_hostgroup_attributes (hostgroup_id INT NOT NULL PRIMARY KEY , max_num_online_servers INT CHECK (max_num_online_servers>=0 AND max_num_online_servers <= 1000000) NOT NULL DEFAULT 1000000 , autocommit INT CHECK (autocommit IN (-1, 0, 1)) NOT NULL DEFAULT -1 , free_connections_pct INT CHECK (free_connections_pct >= 0 AND free_connections_pct <= 100) NOT NULL DEFAULT 10 , init_connect VARCHAR NOT NULL DEFAULT '' , multiplex INT CHECK (multiplex IN (0, 1)) NOT NULL DEFAULT 1 , connection_warming INT CHECK (connection_warming IN (0, 1)) NOT NULL DEFAULT 0 , throttle_connections_per_sec INT CHECK (throttle_connections_per_sec >= 1 AND throttle_connections_per_sec <= 1000000) NOT NULL DEFAULT 1000000 , ignore_session_variables VARCHAR CHECK (JSON_VALID(ignore_session_variables) OR ignore_session_variables = '') NOT NULL DEFAULT '' , hostgroup_settings VARCHAR CHECK (JSON_VALID(hostgroup_settings) OR hostgroup_settings = '') NOT NULL DEFAULT '' , servers_defaults VARCHAR CHECK (JSON_VALID(servers_defaults) OR servers_defaults = '') NOT NULL DEFAULT '' , comment VARCHAR NOT NULL DEFAULT '')"
@@ -359,6 +367,27 @@ class AWS_Aurora_Info {
 	AWS_Aurora_Info& operator=(const AWS_Aurora_Info&) = delete;
 };
 
+// AWS RDS v2. Mirrors AWS_Aurora_Info, trimmed to the mysql_aws_rds_hostgroups
+// columns (no lag/port/new_reader_weight).
+class AWS_RDS_v2_Info {
+	public:
+	int writer_hostgroup;
+	int reader_hostgroup;
+	int check_interval_ms;
+	int check_timeout_ms;
+	int writer_is_also_reader;
+	int autopurge_missing_checks;
+	char * domain_name;
+	char * comment;
+	bool active;
+	bool active_;
+	AWS_RDS_v2_Info(int w, int r, char *_dom, int ci, int ct, bool _a, int wiar, int amc, char *c);
+	bool update(int r, char *_dom, int ci, int ct, bool _a, int wiar, int amc, char *c);
+	~AWS_RDS_v2_Info();
+	AWS_RDS_v2_Info(const AWS_RDS_v2_Info&) = delete;
+	AWS_RDS_v2_Info& operator=(const AWS_RDS_v2_Info&) = delete;
+};
+
 struct p_hg_counter {
 	enum metric {
 		servers_table_version = 0,
@@ -523,6 +552,7 @@ class MySQL_HostGroups_Manager : public Base_HostGroups_Manager<MyHGC> {
 		MYSQL_HOSTGROUP_ATTRIBUTES,
 		MYSQL_SERVERS_SSL_PARAMS,
 		MYSQL_SERVERS,
+		MYSQL_AWS_RDS_HOSTGROUPS,
 
 		HGM_TABLES_SIZE_
 	};
@@ -717,6 +747,12 @@ class MySQL_HostGroups_Manager : public Base_HostGroups_Manager<MyHGC> {
 
 	pthread_mutex_t AWS_Aurora_Info_mutex;
 	std::map<int , AWS_Aurora_Info *> AWS_Aurora_Info_Map;
+
+	void generate_mysql_aws_rds_v2_hostgroups_table();
+	SQLite3_result *incoming_aws_rds_v2_hostgroups;
+
+	pthread_mutex_t AWS_RDS_v2_Info_mutex;
+	std::map<int , AWS_RDS_v2_Info *> AWS_RDS_v2_Info_Map;
 
 	void generate_mysql_hostgroup_attributes_table();
 	SQLite3_result *incoming_hostgroup_attributes;
@@ -1155,6 +1191,12 @@ class MySQL_HostGroups_Manager : public Base_HostGroups_Manager<MyHGC> {
 	 *   be taken or not.
 	 */
 	void update_aws_aurora_hosts_monitor_resultset(bool lock=false);
+
+	/**
+	 * @brief AWS RDS v2. Mirrors update_aws_aurora_hosts_monitor_resultset();
+	 *   rebuilds 'GloMyMon->AWS_RDS_v2_Hosts_resultset' from 'SELECT_AWS_RDS_V2_SERVERS_FOR_MONITOR'.
+	 */
+	void update_aws_rds_v2_hosts_monitor_resultset(bool lock=false);
 
 	SQLite3_result * get_stats_mysql_gtid_executed();
 	void generate_mysql_gtid_executed_tables();

@@ -711,6 +711,7 @@ MySQL_HostGroups_Manager::MySQL_HostGroups_Manager() {
 	pthread_mutex_init(&Group_Replication_Info_mutex, NULL);
 	pthread_mutex_init(&Galera_Info_mutex, NULL);
 	pthread_mutex_init(&AWS_Aurora_Info_mutex, NULL);
+	pthread_mutex_init(&AWS_RDS_v2_Info_mutex, NULL);
 #if 0
 	pthread_mutex_init(&lock, NULL);
 	admindb=NULL;	// initialized only if needed
@@ -736,6 +737,7 @@ MySQL_HostGroups_Manager::MySQL_HostGroups_Manager() {
 	incoming_group_replication_hostgroups=NULL;
 	incoming_galera_hostgroups=NULL;
 	incoming_aws_aurora_hostgroups = NULL;
+	incoming_aws_rds_v2_hostgroups = NULL;
 	incoming_hostgroup_attributes = NULL;
 	incoming_mysql_servers_ssl_params = NULL;
 	incoming_mysql_servers_v2 = NULL;
@@ -998,6 +1000,7 @@ void MySQL_HostGroups_Manager::commit_update_checksums_from_tables(SpookyHash& m
 	CUCFT1(myhash,init,"mysql_group_replication_hostgroups","writer_hostgroup", table_resultset_checksum[HGM_TABLES::MYSQL_GROUP_REPLICATION_HOSTGROUPS]);
 	CUCFT1(myhash,init,"mysql_galera_hostgroups","writer_hostgroup", table_resultset_checksum[HGM_TABLES::MYSQL_GALERA_HOSTGROUPS]);
 	CUCFT1(myhash,init,"mysql_aws_aurora_hostgroups","writer_hostgroup", table_resultset_checksum[HGM_TABLES::MYSQL_AWS_AURORA_HOSTGROUPS]);
+	CUCFT1(myhash,init,"mysql_aws_rds_hostgroups","writer_hostgroup", table_resultset_checksum[HGM_TABLES::MYSQL_AWS_RDS_HOSTGROUPS]);
 	CUCFT1(myhash,init,"mysql_hostgroup_attributes","hostgroup_id", table_resultset_checksum[HGM_TABLES::MYSQL_HOSTGROUP_ATTRIBUTES]);
 	CUCFT1(myhash,init,"mysql_servers_ssl_params","hostname,port,username", table_resultset_checksum[HGM_TABLES::MYSQL_SERVERS_SSL_PARAMS]);
 }
@@ -1544,6 +1547,13 @@ bool MySQL_HostGroups_Manager::commit(
 			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "DELETE FROM mysql_aws_aurora_hostgroups\n");
 			mydb->execute("DELETE FROM mysql_aws_aurora_hostgroups");
 			generate_mysql_aws_aurora_hostgroups_table();
+		}
+
+		// AWS RDS v2
+		if (incoming_aws_rds_v2_hostgroups) {
+			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "DELETE FROM mysql_aws_rds_hostgroups\n");
+			mydb->execute("DELETE FROM mysql_aws_rds_hostgroups");
+			generate_mysql_aws_rds_v2_hostgroups_table();
 		}
 
 		// hostgroup attributes
@@ -2273,6 +2283,9 @@ SQLite3_result * MySQL_HostGroups_Manager::dump_table_mysql(const string& name) 
 	if (name == "mysql_aws_aurora_hostgroups") {
 		query=(char *)"SELECT writer_hostgroup,reader_hostgroup,active,aurora_port,domain_name,max_lag_ms,"
 					    "check_interval_ms,check_timeout_ms,writer_is_also_reader,new_reader_weight,add_lag_ms,min_lag_ms,lag_num_checks,autopurge_missing_checks,comment FROM mysql_aws_aurora_hostgroups";
+	} else if (name == "mysql_aws_rds_hostgroups") {
+		query=(char *)"SELECT writer_hostgroup,reader_hostgroup,active,domain_name,"
+					    "check_interval_ms,check_timeout_ms,writer_is_also_reader,autopurge_missing_checks,comment FROM mysql_aws_rds_hostgroups";
 	} else if (name == "mysql_galera_hostgroups") {
 		query=(char *)"SELECT writer_hostgroup,backup_writer_hostgroup,reader_hostgroup,offline_hostgroup,active,max_writers,writer_is_also_reader,max_transactions_behind,comment FROM mysql_galera_hostgroups";
 	} else if (name == "mysql_group_replication_hostgroups") {
@@ -3103,6 +3116,8 @@ void MySQL_HostGroups_Manager::save_incoming_mysql_table(SQLite3_result *s, cons
 	SQLite3_result ** inc = NULL;
 	if (name == "mysql_aws_aurora_hostgroups") {
 		inc = &incoming_aws_aurora_hostgroups;
+	} else if (name == "mysql_aws_rds_hostgroups") {
+		inc = &incoming_aws_rds_v2_hostgroups;
 	} else if (name == "mysql_galera_hostgroups") {
 		inc = &incoming_galera_hostgroups;
 	} else if (name == "mysql_group_replication_hostgroups") {
@@ -3167,6 +3182,8 @@ void MySQL_HostGroups_Manager::save_mysql_servers_v2(SQLite3_result* s) {
 SQLite3_result* MySQL_HostGroups_Manager::get_current_mysql_table(const string& name) {
 	if (name == "mysql_aws_aurora_hostgroups") {
 		return this->incoming_aws_aurora_hostgroups;
+	} else if (name == "mysql_aws_rds_hostgroups") {
+		return this->incoming_aws_rds_v2_hostgroups;
 	} else if (name == "mysql_galera_hostgroups") {
 		return this->incoming_galera_hostgroups;
 	} else if (name == "mysql_group_replication_hostgroups") {
@@ -5988,6 +6005,98 @@ bool AWS_Aurora_Info::update(int r, int _port, char *_end_addr, int maxl, int al
 	return ret;
 }
 
+// AWS RDS v2. Mirrors AWS_Aurora_Info, trimmed to the mysql_aws_rds_hostgroups columns.
+AWS_RDS_v2_Info::AWS_RDS_v2_Info(int w, int r, char *_dom, int ci, int ct, bool _a, int wiar, int amc, char *c) {
+	comment=NULL;
+	if (c) {
+		comment=strdup(c);
+	}
+	writer_hostgroup=w;
+	reader_hostgroup=r;
+	check_interval_ms=ci;
+	check_timeout_ms=ct;
+	writer_is_also_reader=wiar;
+	autopurge_missing_checks=amc;
+	active=_a;
+	active_=true;
+	domain_name = strdup(_dom ? _dom : "");
+}
+
+AWS_RDS_v2_Info::~AWS_RDS_v2_Info() {
+	if (comment) {
+		free(comment);
+		comment=NULL;
+	}
+	if (domain_name) {
+		free(domain_name);
+		domain_name=NULL;
+	}
+}
+
+bool AWS_RDS_v2_Info::update(int r, char *_dom, int ci, int ct, bool _a, int wiar, int amc, char *c) {
+	bool ret=false;
+	active_=true;
+	if (reader_hostgroup!=r) {
+		reader_hostgroup=r;
+		ret=true;
+	}
+	if (check_interval_ms!=ci) {
+		check_interval_ms=ci;
+		ret=true;
+	}
+	if (check_timeout_ms!=ct) {
+		check_timeout_ms=ct;
+		ret=true;
+	}
+	if (writer_is_also_reader != wiar) {
+		writer_is_also_reader = wiar;
+		ret = true;
+	}
+	if (autopurge_missing_checks != amc) {
+		autopurge_missing_checks = amc;
+		ret = true;
+	}
+	if (active!=_a) {
+		active=_a;
+		ret=true;
+	}
+	if (domain_name) {
+		if (_dom) {
+			if (strcmp(domain_name,_dom)) {
+				free(domain_name);
+				domain_name = strdup(_dom);
+				ret = true;
+			}
+		} else {
+			free(domain_name);
+			domain_name=NULL;
+			ret = true;
+		}
+	} else {
+		if (_dom) {
+			domain_name=strdup(_dom);
+			ret = true;
+		}
+	}
+	// for comment we don't change return value
+	if (comment) {
+		if (c) {
+			if (strcmp(comment,c)) {
+				free(comment);
+				comment=strdup(c);
+			}
+		} else {
+			free(comment);
+			comment=NULL;
+		}
+	} else {
+		if (c) {
+			comment=strdup(c);
+		}
+	}
+	return ret;
+}
+
 /**
  * @brief Initializes the supplied 'MyHGC' with the specified 'hostgroup_settings'.
  * @details Input verification is performed in the supplied 'hostgroup_settings'. It's expected to be a valid
@@ -6337,6 +6446,82 @@ void MySQL_HostGroups_Manager::generate_mysql_aws_aurora_hostgroups_table() {
 	pthread_mutex_unlock(&GloMyMon->aws_aurora_mutex);
 
 	pthread_mutex_unlock(&AWS_Aurora_Info_mutex);
+}
+
+// AWS RDS v2. Mirrors generate_mysql_aws_aurora_hostgroups_table(), trimmed to the v2 columns.
+void MySQL_HostGroups_Manager::generate_mysql_aws_rds_v2_hostgroups_table() {
+	if (incoming_aws_rds_v2_hostgroups==NULL) {
+		return;
+	}
+	int rc;
+	char *query=(char *)"INSERT INTO mysql_aws_rds_hostgroups(writer_hostgroup,reader_hostgroup,active,domain_name,check_interval_ms,"
+					    "check_timeout_ms,writer_is_also_reader,autopurge_missing_checks,comment) VALUES "
+					    "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+	auto [rc1, statement_unique] = mydb->prepare_v2(query);
+	ASSERT_SQLITE_OK(rc1, mydb);
+	sqlite3_stmt *statement = statement_unique.get();
+	proxy_info("New mysql_aws_rds_hostgroups table\n");
+	pthread_mutex_lock(&AWS_RDS_v2_Info_mutex);
+	for (std::map<int , AWS_RDS_v2_Info *>::iterator it1 = AWS_RDS_v2_Info_Map.begin() ; it1 != AWS_RDS_v2_Info_Map.end(); ++it1) {
+		AWS_RDS_v2_Info *info=NULL;
+		info=it1->second;
+		info->active_=false;
+	}
+	for (std::vector<SQLite3_row *>::iterator it = incoming_aws_rds_v2_hostgroups->rows.begin() ; it != incoming_aws_rds_v2_hostgroups->rows.end(); ++it) {
+		SQLite3_row *r=*it;
+		int writer_hostgroup=atoi(r->fields[0]);
+		int reader_hostgroup=atoi(r->fields[1]);
+		int active=atoi(r->fields[2]);
+		int check_interval_ms = atoi(r->fields[4]);
+		int check_timeout_ms = atoi(r->fields[5]);
+		int writer_is_also_reader = atoi(r->fields[6]);
+		int autopurge_missing_checks = atoi(r->fields[7]);
+		proxy_info("Loading AWS RDS v2 info for (%d,%d,%s,\"%s\",%d,%d,%d,%d,\"%s\")\n", writer_hostgroup,reader_hostgroup,(active ? "on" : "off"),
+				   r->fields[3],check_interval_ms,check_timeout_ms,writer_is_also_reader,autopurge_missing_checks,r->fields[8]);
+		rc=(*proxy_sqlite3_bind_int64)(statement, 1, writer_hostgroup); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_int64)(statement, 2, reader_hostgroup); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_int64)(statement, 3, active); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_text)(statement, 4, r->fields[3], -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_int64)(statement, 5, check_interval_ms); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_int64)(statement, 6, check_timeout_ms); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_int64)(statement, 7, writer_is_also_reader); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_int64)(statement, 8, autopurge_missing_checks); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_bind_text)(statement, 9, r->fields[8], -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, mydb);
+
+		SAFE_SQLITE3_STEP2(statement);
+		rc=(*proxy_sqlite3_clear_bindings)(statement); ASSERT_SQLITE_OK(rc, mydb);
+		rc=(*proxy_sqlite3_reset)(statement); ASSERT_SQLITE_OK(rc, mydb);
+		std::map<int , AWS_RDS_v2_Info *>::iterator it2;
+		it2 = AWS_RDS_v2_Info_Map.find(writer_hostgroup);
+		AWS_RDS_v2_Info *info=NULL;
+		if (it2!=AWS_RDS_v2_Info_Map.end()) {
+			info=it2->second;
+			info->update(reader_hostgroup, r->fields[3], check_interval_ms, check_timeout_ms, (bool)active, writer_is_also_reader, autopurge_missing_checks, r->fields[8]);
+		} else {
+			info=new AWS_RDS_v2_Info(writer_hostgroup, reader_hostgroup, r->fields[3], check_interval_ms, check_timeout_ms, (bool)active, writer_is_also_reader, autopurge_missing_checks, r->fields[8]);
+			AWS_RDS_v2_Info_Map.insert(AWS_RDS_v2_Info_Map.begin(), std::pair<int, AWS_RDS_v2_Info *>(writer_hostgroup,info));
+		}
+	}
+	delete incoming_aws_rds_v2_hostgroups;
+	incoming_aws_rds_v2_hostgroups=NULL;
+
+	// remove missing ones
+	for (auto it3 = AWS_RDS_v2_Info_Map.begin(); it3 != AWS_RDS_v2_Info_Map.end(); ) {
+		AWS_RDS_v2_Info *info=it3->second;
+		if (info->active_==false) {
+			delete info;
+			it3 = AWS_RDS_v2_Info_Map.erase(it3);
+		} else {
+			it3++;
+		}
+	}
+
+	// it is now time to build a new structure in Monitor
+	pthread_mutex_lock(&GloMyMon->aws_rds_v2_mutex);
+	update_aws_rds_v2_hosts_monitor_resultset(false);
+	pthread_mutex_unlock(&GloMyMon->aws_rds_v2_mutex);
+
+	pthread_mutex_unlock(&AWS_RDS_v2_Info_mutex);
 }
 
 
@@ -6912,6 +7097,44 @@ void MySQL_HostGroups_Manager::update_aws_aurora_hosts_monitor_resultset(bool lo
 	if (lock) {
 		pthread_mutex_unlock(&GloMyMon->aws_aurora_mutex);
 		pthread_mutex_unlock(&AWS_Aurora_Info_mutex);
+	}
+}
+
+// AWS RDS v2. Mirrors SELECT_AWS_AURORA_SERVERS_FOR_MONITOR /
+// update_aws_aurora_hosts_monitor_resultset(), trimmed to the v2 columns.
+const char SELECT_AWS_RDS_V2_SERVERS_FOR_MONITOR[] {
+	"SELECT writer_hostgroup, reader_hostgroup, hostname, port, MAX(use_ssl) use_ssl, weight, check_interval_ms,"
+		" check_timeout_ms, writer_is_also_reader, autopurge_missing_checks, domain_name FROM mysql_servers"
+	" JOIN mysql_aws_rds_hostgroups ON"
+		" hostgroup_id=writer_hostgroup OR hostgroup_id=reader_hostgroup WHERE active=1 AND status NOT IN (2,3)"
+	" GROUP BY writer_hostgroup, hostname, port"
+};
+
+void MySQL_HostGroups_Manager::update_aws_rds_v2_hosts_monitor_resultset(bool lock) {
+	if (lock) {
+		pthread_mutex_lock(&AWS_RDS_v2_Info_mutex);
+		pthread_mutex_lock(&GloMyMon->aws_rds_v2_mutex);
+	}
+
+	SQLite3_result* resultset = nullptr;
+	{
+		char* error = nullptr;
+		int cols = 0;
+		int affected_rows = 0;
+		mydb->execute_statement(SELECT_AWS_RDS_V2_SERVERS_FOR_MONITOR, &error, &cols, &affected_rows, &resultset);
+	}
+
+	if (resultset) {
+		if (GloMyMon->AWS_RDS_v2_Hosts_resultset) {
+			delete GloMyMon->AWS_RDS_v2_Hosts_resultset;
+		}
+		GloMyMon->AWS_RDS_v2_Hosts_resultset=resultset;
+		GloMyMon->AWS_RDS_v2_Hosts_resultset_checksum=resultset->raw_checksum();
+	}
+
+	if (lock) {
+		pthread_mutex_unlock(&GloMyMon->aws_rds_v2_mutex);
+		pthread_mutex_unlock(&AWS_RDS_v2_Info_mutex);
 	}
 }
 

@@ -573,6 +573,7 @@ class MySQL_Monitor {
 	pthread_mutex_t galera_mutex; // for simplicity, a mutex instead of a rwlock
 	pthread_mutex_t aws_aurora_mutex; // for simplicity, a mutex instead of a rwlock
 	pthread_mutex_t aws_rds_mutex; // for simplicity, a mutex instead of a rwlock
+	pthread_mutex_t aws_rds_v2_mutex; // AWS RDS v2; for simplicity, a mutex instead of a rwlock
 	pthread_mutex_t mysql_servers_mutex; // for simplicity, a mutex instead of a rwlock
 	pthread_mutex_t proxysql_servers_mutex; 
 	//std::map<char *, MyGR_monitor_node *, cmp_str> Group_Replication_Hosts_Map;
@@ -586,6 +587,9 @@ class MySQL_Monitor {
 	SQLite3_result* AWS_RDS_Hosts_resultset { nullptr };
 	uint64_t AWS_RDS_Hosts_resultset_checksum { 0 };
 	std::map<std::string, AWS_RDS_monitor_node> AWS_RDS_Hosts_Map {};
+	// AWS RDS v2
+	SQLite3_result* AWS_RDS_v2_Hosts_resultset { nullptr };
+	uint64_t AWS_RDS_v2_Hosts_resultset_checksum { 0 };
 	unsigned int num_threads;
 	unsigned int aux_threads;
 	unsigned int started_threads;

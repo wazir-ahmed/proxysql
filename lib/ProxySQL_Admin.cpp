@@ -148,6 +148,7 @@ static const vector<string> mysql_servers_tablenames = {
 	"mysql_group_replication_hostgroups",
 	"mysql_galera_hostgroups",
 	"mysql_aws_aurora_hostgroups",
+	"mysql_aws_rds_hostgroups",
 	"mysql_hostgroup_attributes",
 	"mysql_servers_ssl_params",
 };
@@ -1512,6 +1513,8 @@ bool ProxySQL_Admin::GenericRefreshStatistics(const char *query_no_space, unsign
 				strstr(query_no_space,"runtime_mysql_galera_hostgroups")
 				||
 				strstr(query_no_space,"runtime_mysql_aws_aurora_hostgroups")
+				||
+				strstr(query_no_space,"runtime_mysql_aws_rds_hostgroups")
 				||
 				strstr(query_no_space,"runtime_mysql_hostgroup_attributes")
 				||
@@ -7567,6 +7570,52 @@ void ProxySQL_Admin::save_mysql_servers_runtime_to_database(bool _runtime) {
 	if(resultset) delete resultset;
 	resultset=NULL;
 
+	// dump mysql_aws_rds_hostgroups (AWS RDS v2)
+
+	if (_runtime) {
+		query=(char *)"DELETE FROM main.runtime_mysql_aws_rds_hostgroups";
+	} else {
+		query=(char *)"DELETE FROM main.mysql_aws_rds_hostgroups";
+	}
+	proxy_debug(PROXY_DEBUG_ADMIN, 4, "%s\n", query);
+	admindb->execute(query);
+	resultset=MyHGM->dump_table_mysql("mysql_aws_rds_hostgroups");
+	if (resultset) {
+		int rc;
+		sqlite3_stmt *statement=NULL;
+
+		char *query=NULL;
+		if (_runtime) {
+			query=(char *)"INSERT INTO runtime_mysql_aws_rds_hostgroups(writer_hostgroup,reader_hostgroup,active,domain_name,check_interval_ms,check_timeout_ms,writer_is_also_reader,autopurge_missing_checks,comment) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+		} else {
+			query=(char *)"INSERT INTO mysql_aws_rds_hostgroups(writer_hostgroup,reader_hostgroup,active,domain_name,check_interval_ms,check_timeout_ms,writer_is_also_reader,autopurge_missing_checks,comment) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+		}
+
+		auto [rc1, statement_unique] = admindb->prepare_v2(query);
+		rc = rc1;
+		statement = statement_unique.get();
+		ASSERT_SQLITE_OK(rc, admindb);
+
+		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+			SQLite3_row *r=*it;
+			rc=(*proxy_sqlite3_bind_int64)(statement, 1, atoi(r->fields[0])); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_int64)(statement, 2, atoi(r->fields[1])); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_int64)(statement, 3, atoi(r->fields[2])); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_text)(statement, 4, r->fields[3], -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_int64)(statement, 5, atoi(r->fields[4])); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_int64)(statement, 6, atoi(r->fields[5])); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_int64)(statement, 7, atoi(r->fields[6])); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_int64)(statement, 8, atoi(r->fields[7])); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_bind_text)(statement, 9, r->fields[8], -1, SQLITE_TRANSIENT); ASSERT_SQLITE_OK(rc, admindb);
+
+			SAFE_SQLITE3_STEP2(statement);
+			rc=(*proxy_sqlite3_clear_bindings)(statement); ASSERT_SQLITE_OK(rc, admindb);
+			rc=(*proxy_sqlite3_reset)(statement); ASSERT_SQLITE_OK(rc, admindb);
+		}
+	}
+	if(resultset) delete resultset;
+	resultset=NULL;
+
 	// dump mysql_hostgroup_attributes
 
 	StrQuery = "DELETE FROM main.";
@@ -8059,6 +8108,35 @@ void ProxySQL_Admin::load_mysql_servers_to_runtime(const incoming_servers_t& inc
 	} else {
 		// Pass the resultset to MyHGM
 		MyHGM->save_incoming_mysql_table(resultset_aws_aurora,"mysql_aws_aurora_hostgroups");
+	}
+
+	// support for AWS RDS v2, table mysql_aws_rds_hostgroups
+	{
+		SQLite3_result* resultset_aws_rds = nullptr;
+		// look for invalid combinations
+		query=(char *)"SELECT a.* FROM mysql_aws_rds_hostgroups a JOIN mysql_aws_rds_hostgroups b ON a.writer_hostgroup=b.reader_hostgroup WHERE b.reader_hostgroup";
+		proxy_debug(PROXY_DEBUG_ADMIN, 4, "%s\n", query);
+		admindb->execute_statement(query, &error , &cols , &affected_rows , &resultset);
+		if (error) {
+			proxy_error("Error on %s : %s\n", query, error);
+		} else {
+			for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+				SQLite3_row *r=*it;
+				proxy_error("Incompatible entry in mysql_aws_rds_hostgroups will be ignored : ( %s , %s , %s , %s )\n", r->fields[0], r->fields[1], r->fields[2], r->fields[3]);
+			}
+		}
+		if (resultset) delete resultset;
+		resultset=NULL;
+
+		query=(char *)"SELECT a.* FROM mysql_aws_rds_hostgroups a LEFT JOIN mysql_aws_rds_hostgroups b ON (a.writer_hostgroup=b.reader_hostgroup) WHERE b.reader_hostgroup IS NULL ORDER BY writer_hostgroup";
+		proxy_debug(PROXY_DEBUG_ADMIN, 4, "%s\n", query);
+		admindb->execute_statement(query, &error , &cols , &affected_rows , &resultset_aws_rds);
+		if (error) {
+			proxy_error("Error on %s : %s\n", query, error);
+		} else {
+			// Pass the resultset to MyHGM
+			MyHGM->save_incoming_mysql_table(resultset_aws_rds,"mysql_aws_rds_hostgroups");
+		}
 	}
 
 	// support for hostgroup attributes, table mysql_hostgroup_attributes
