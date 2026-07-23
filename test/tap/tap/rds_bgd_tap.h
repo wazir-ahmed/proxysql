@@ -220,6 +220,18 @@ inline void bgd_dump_probe_log_since(RDS_BGD_Simulator& sim, uint64_t sequence) 
 	}
 }
 
+inline rc_t<uint64_t> bgd_probe_count_since(
+	RDS_BGD_Simulator& sim, uint64_t sequence, const Endpoint& backend, RDS_BGD_Probe_Kind kind)
+{
+	auto [rc, logs] = sim.probe_log_since(sequence);
+	if (rc != EXIT_SUCCESS) return { EXIT_FAILURE, 0 };
+	uint64_t count = 0;
+	for (const RDS_BGD_Probe_Log& log : logs) {
+		if (log.backend.host == backend.host && log.backend.port == backend.port && log.probe_kind == kind) ++count;
+	}
+	return { EXIT_SUCCESS, count };
+}
+
 inline void bgd_timeout_diagnostics(
 	MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence, const string& scenario,
 	const string& phase, const string& expected, int writer_hostgroup, const vector<int>& server_hostgroups)
