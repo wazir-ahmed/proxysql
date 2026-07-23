@@ -116,6 +116,32 @@ int establish_green_pools(const CommandLine& cl, MYSQL* admin, const BGD_Hostgro
 	return rc;
 }
 
+int wait_for_green_pool_baseline(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence,
+	const string& scenario, const BGD_Hostgroups& hgs, const string& phase)
+{
+	const string query = "SELECT "
+		"(SELECT COALESCE(SUM(ConnUsed+ConnFree),0) FROM stats_mysql_connection_pool WHERE hostgroup=" +
+		to_string(hgs.green_writer) + ")>0 AND "
+		"(SELECT COALESCE(SUM(ConnUsed+ConnFree),0) FROM stats_mysql_connection_pool WHERE hostgroup=" +
+		to_string(hgs.green_reader) + ")>0";
+	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, scenario, phase,
+		"green writer and reader pool baselines", hgs.blue_writer,
+		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
+}
+
+int wait_for_green_pool_drain(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence,
+	const string& scenario, const BGD_Hostgroups& hgs, const string& phase)
+{
+	const string query = "SELECT "
+		"(SELECT COALESCE(SUM(ConnUsed+ConnFree),0) FROM stats_mysql_connection_pool WHERE hostgroup=" +
+		to_string(hgs.green_writer) + ")=0 AND "
+		"(SELECT COALESCE(SUM(ConnUsed+ConnFree),0) FROM stats_mysql_connection_pool WHERE hostgroup=" +
+		to_string(hgs.green_reader) + ")=0";
+	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, scenario, phase,
+		"green writer and reader pools drained", hgs.blue_writer,
+		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
+}
+
 int enter_in_progress(MYSQL* admin, RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster,
 	const BGD_Hostgroups& hgs, const string& scenario, uint64_t& sequence)
 {
@@ -139,7 +165,11 @@ int enter_reader_switchover(MYSQL* admin, RDS_BGD_Simulator& sim, RDS_BGD_Cluste
 	auto [post_seq_rc, post_seq] = sim.probe_log_last_sequence();
 	int rc = post_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_reader_pair(cluster, "SWITCHOVER_IN_POST_PROCESSING")) : EXIT_FAILURE;
 	if (rc != EXIT_SUCCESS || wait_for_status(admin, sim, post_seq, scenario, hgs, "post-processing", "WRITER_SWITCHOVER_POST_PROCESSING") != EXIT_SUCCESS ||
-		!server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "SHUNNED_AWS_BGD")) return EXIT_FAILURE;
+		bgd_wait_for_condition(admin,
+			"SELECT COUNT(*)=1 FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+			" AND hostname=" + bgd_sql_quote(cluster.blue_readers[1].hostname) + " AND port=3306 AND status='SHUNNED_AWS_BGD'",
+			kTimeoutSeconds, sim, post_seq, scenario, "post-processing shun", "unmatched reader is BGD shunned",
+			hgs.blue_writer, { hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader }) != EXIT_SUCCESS) return EXIT_FAILURE;
 	auto [completed_seq_rc, completed_seq] = sim.probe_log_last_sequence();
 	rc = completed_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, target_only_completed(cluster)) : EXIT_FAILURE;
 	if (rc != EXIT_SUCCESS || wait_for_status(admin, sim, completed_seq, scenario, hgs, "writer-completed", "READER_SWITCHOVER_IN_PROGRESS") != EXIT_SUCCESS) return EXIT_FAILURE;
@@ -239,15 +269,23 @@ int main() {
 		{ empty_reader.green_writer, empty_reader.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure reader present-empty scenario");
 	rc = enter_reader_switchover(admin, sim, empty_reader, empty_reader_hgs, "reader-present-empty", sequence);
 	pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, empty_reader_hgs) : EXIT_FAILURE;
-	auto [empty_reader_pool_rc, empty_reader_pool] = bgd_connection_pool_count(admin, empty_reader_hgs.green_writer);
+	int empty_reader_baseline_rc = pools_rc == EXIT_SUCCESS ? wait_for_green_pool_baseline(admin, sim, sequence,
+		"reader-present-empty", empty_reader_hgs, "green pool baseline") : EXIT_FAILURE;
+	auto [empty_reader_writer_pool_rc, empty_reader_writer_pool] = bgd_connection_pool_count(admin, empty_reader_hgs.green_writer);
+	auto [empty_reader_reader_pool_rc, empty_reader_reader_pool] = bgd_connection_pool_count(admin, empty_reader_hgs.green_reader);
 	auto [empty_reader_seq_rc, empty_reader_seq] = sim.probe_log_last_sequence();
 	rc = rc == EXIT_SUCCESS && empty_reader_seq_rc == EXIT_SUCCESS ? sim.topology_delete(empty_reader_backends) : EXIT_FAILURE;
 	int empty_reader_none_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, empty_reader_seq, "reader-present-empty", empty_reader_hgs, "present-empty", "NONE") : EXIT_FAILURE;
-	auto [empty_reader_after_pool_rc, empty_reader_after_pool] = bgd_connection_pool_count(admin, empty_reader_hgs.green_writer);
-	ok(pools_rc == EXIT_SUCCESS && empty_reader_pool_rc == EXIT_SUCCESS && empty_reader_pool >= 1 && rc == EXIT_SUCCESS && empty_reader_none_rc == EXIT_SUCCESS &&
-		empty_reader_after_pool_rc == EXIT_SUCCESS && empty_reader_after_pool == 0 &&
+	int empty_reader_drain_rc = empty_reader_none_rc == EXIT_SUCCESS ? wait_for_green_pool_drain(admin, sim, empty_reader_seq,
+		"reader-present-empty", empty_reader_hgs, "successful cleanup") : EXIT_FAILURE;
+	auto [empty_reader_after_writer_rc, empty_reader_after_writer] = bgd_connection_pool_count(admin, empty_reader_hgs.green_writer);
+	auto [empty_reader_after_reader_rc, empty_reader_after_reader] = bgd_connection_pool_count(admin, empty_reader_hgs.green_reader);
+	ok(pools_rc == EXIT_SUCCESS && empty_reader_baseline_rc == EXIT_SUCCESS && empty_reader_writer_pool_rc == EXIT_SUCCESS && empty_reader_writer_pool >= 1 &&
+		empty_reader_reader_pool_rc == EXIT_SUCCESS && empty_reader_reader_pool >= 1 && rc == EXIT_SUCCESS && empty_reader_none_rc == EXIT_SUCCESS &&
+		empty_reader_drain_rc == EXIT_SUCCESS && empty_reader_after_writer_rc == EXIT_SUCCESS && empty_reader_after_writer == 0 &&
+		empty_reader_after_reader_rc == EXIT_SUCCESS && empty_reader_after_reader == 0 &&
 		server_has_status(admin, empty_reader_hgs.blue_reader, empty_reader.blue_readers[1], "ONLINE") && green_rows_remain(admin, empty_reader_hgs, empty_reader),
-		"reader-switchover successful empty metadata unshuns readers, drains green pools, and retains green rows");
+		"reader-switchover successful empty metadata unshuns readers, drains both green pools, and retains green rows");
 	ok(telemetry_has_kind(sim, empty_reader_seq, empty_reader.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata),
 		"reader-switchover empty topology is observed through successful direct metadata");
 
@@ -262,15 +300,23 @@ int main() {
 		{ absent_reader.green_writer, absent_reader.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure reader absent scenario");
 	rc = enter_reader_switchover(admin, sim, absent_reader, absent_reader_hgs, "reader-absent", sequence);
 	pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, absent_reader_hgs) : EXIT_FAILURE;
-	auto [absent_reader_pool_rc, absent_reader_pool] = bgd_connection_pool_count(admin, absent_reader_hgs.green_writer);
+	int absent_reader_baseline_rc = pools_rc == EXIT_SUCCESS ? wait_for_green_pool_baseline(admin, sim, sequence,
+		"reader-absent", absent_reader_hgs, "green pool baseline") : EXIT_FAILURE;
+	auto [absent_reader_writer_pool_rc, absent_reader_writer_pool] = bgd_connection_pool_count(admin, absent_reader_hgs.green_writer);
+	auto [absent_reader_reader_pool_rc, absent_reader_reader_pool] = bgd_connection_pool_count(admin, absent_reader_hgs.green_reader);
 	auto [absent_reader_seq_rc, absent_reader_seq] = sim.probe_log_last_sequence();
 	rc = rc == EXIT_SUCCESS && absent_reader_seq_rc == EXIT_SUCCESS ? sim.topology_drop(absent_reader_backends) : EXIT_FAILURE;
 	int absent_reader_none_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, absent_reader_seq, "reader-absent", absent_reader_hgs, "absent", "NONE") : EXIT_FAILURE;
-	auto [absent_reader_after_pool_rc, absent_reader_after_pool] = bgd_connection_pool_count(admin, absent_reader_hgs.green_writer);
-	ok(pools_rc == EXIT_SUCCESS && absent_reader_pool_rc == EXIT_SUCCESS && absent_reader_pool >= 1 && rc == EXIT_SUCCESS && absent_reader_none_rc == EXIT_SUCCESS &&
-		absent_reader_after_pool_rc == EXIT_SUCCESS && absent_reader_after_pool == 0 &&
+	int absent_reader_drain_rc = absent_reader_none_rc == EXIT_SUCCESS ? wait_for_green_pool_drain(admin, sim, absent_reader_seq,
+		"reader-absent", absent_reader_hgs, "successful cleanup") : EXIT_FAILURE;
+	auto [absent_reader_after_writer_rc, absent_reader_after_writer] = bgd_connection_pool_count(admin, absent_reader_hgs.green_writer);
+	auto [absent_reader_after_reader_rc, absent_reader_after_reader] = bgd_connection_pool_count(admin, absent_reader_hgs.green_reader);
+	ok(pools_rc == EXIT_SUCCESS && absent_reader_baseline_rc == EXIT_SUCCESS && absent_reader_writer_pool_rc == EXIT_SUCCESS && absent_reader_writer_pool >= 1 &&
+		absent_reader_reader_pool_rc == EXIT_SUCCESS && absent_reader_reader_pool >= 1 && rc == EXIT_SUCCESS && absent_reader_none_rc == EXIT_SUCCESS &&
+		absent_reader_drain_rc == EXIT_SUCCESS && absent_reader_after_writer_rc == EXIT_SUCCESS && absent_reader_after_writer == 0 &&
+		absent_reader_after_reader_rc == EXIT_SUCCESS && absent_reader_after_reader == 0 &&
 		server_has_status(admin, absent_reader_hgs.blue_reader, absent_reader.blue_readers[1], "ONLINE") && green_rows_remain(admin, absent_reader_hgs, absent_reader),
-		"reader-switchover absent topology performs successful cleanup rather than blue rollback");
+		"reader-switchover absent topology drains both green pools and performs successful cleanup rather than blue rollback");
 	ok(telemetry_has_kind(sim, absent_reader_seq, absent_reader.blue_writer.endpoint(), RDS_BGD_Probe_Kind::table_check),
 		"reader-switchover dropped topology remains distinguishable as a table-check observation");
 
@@ -291,18 +337,20 @@ int main() {
 		error_1146_pre.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin,
 		"metadata-1146-precompletion", "1146 metadata", error_1146_pre_hgs.blue_writer,
 		{ error_1146_pre_hgs.blue_writer, error_1146_pre_hgs.blue_reader, error_1146_pre_hgs.green_writer, error_1146_pre_hgs.green_reader }) : rc_t<RDS_BGD_Probe_Log> { EXIT_FAILURE, {} };
-	int drop_after_1146_rc = error_1146_metadata_rc == EXIT_SUCCESS ? sim.topology_drop({ error_1146_pre.blue_writer.endpoint() }) : EXIT_FAILURE;
+	int error_1146_none_rc = error_1146_metadata_rc == EXIT_SUCCESS ? wait_for_status(admin, sim, error_1146_metadata.sequence_id,
+		"metadata-1146-precompletion", error_1146_pre_hgs, "metadata absence", "NONE") : EXIT_FAILURE;
+	int error_1146_rollback_rc = error_1146_none_rc == EXIT_SUCCESS ? wait_for_precompletion_effects(admin, sim,
+		error_1146_metadata.sequence_id, "metadata-1146-precompletion", error_1146_pre_hgs, error_1146_pre, false) : EXIT_FAILURE;
+	int drop_after_1146_rc = error_1146_rollback_rc == EXIT_SUCCESS ? sim.topology_drop({ error_1146_pre.blue_writer.endpoint() }) : EXIT_FAILURE;
 	const uint64_t table_baseline = error_1146_metadata_rc == EXIT_SUCCESS ? error_1146_metadata.sequence_id : error_1146_pre_seq;
 	auto [error_1146_table_rc, error_1146_table] = drop_after_1146_rc == EXIT_SUCCESS ? bgd_wait_for_probe(sim, table_baseline,
 		error_1146_pre.blue_writer.endpoint(), RDS_BGD_Probe_Kind::table_check, kProbeTimeoutMs, 0, admin,
-		"metadata-1146-precompletion", "fallback table check", error_1146_pre_hgs.blue_writer,
+		"metadata-1146-precompletion", "post-cleanup table check", error_1146_pre_hgs.blue_writer,
 		{ error_1146_pre_hgs.blue_writer, error_1146_pre_hgs.blue_reader, error_1146_pre_hgs.green_writer, error_1146_pre_hgs.green_reader }) : rc_t<RDS_BGD_Probe_Log> { EXIT_FAILURE, {} };
-	int error_1146_none_rc = error_1146_table_rc == EXIT_SUCCESS ? wait_for_status(admin, sim, error_1146_table.sequence_id,
-		"metadata-1146-precompletion", error_1146_pre_hgs, "fallback absence", "NONE") : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && error_1146_metadata_rc == EXIT_SUCCESS && drop_after_1146_rc == EXIT_SUCCESS &&
-		error_1146_table_rc == EXIT_SUCCESS && error_1146_metadata.sequence_id < error_1146_table.sequence_id && error_1146_none_rc == EXIT_SUCCESS &&
-		wait_for_precompletion_effects(admin, sim, error_1146_table.sequence_id, "metadata-1146-precompletion", error_1146_pre_hgs, error_1146_pre, false) == EXIT_SUCCESS,
-		"metadata error 1146 is followed by table checking and the pre-completion rollback absence policy");
+		error_1146_none_rc == EXIT_SUCCESS && error_1146_rollback_rc == EXIT_SUCCESS && error_1146_table_rc == EXIT_SUCCESS &&
+		error_1146_metadata.sequence_id < error_1146_table.sequence_id,
+		"metadata error 1146 immediately applies pre-completion rollback, then returns to table checking");
 
 	// The same 1146 path uses reader cleanup after completion.
 	RDS_BGD_Cluster error_1146_reader = bgd_cluster_2_init();
@@ -315,7 +363,10 @@ int main() {
 		{ error_1146_reader.green_writer, error_1146_reader.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure 1146 reader scenario");
 	rc = enter_reader_switchover(admin, sim, error_1146_reader, error_1146_reader_hgs, "metadata-1146-reader", sequence);
 	pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, error_1146_reader_hgs) : EXIT_FAILURE;
-	auto [error_1146_reader_pool_rc, error_1146_reader_pool] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_writer);
+	int error_1146_reader_baseline_rc = pools_rc == EXIT_SUCCESS ? wait_for_green_pool_baseline(admin, sim, sequence,
+		"metadata-1146-reader", error_1146_reader_hgs, "green pool baseline") : EXIT_FAILURE;
+	auto [error_1146_reader_writer_pool_rc, error_1146_reader_writer_pool] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_writer);
+	auto [error_1146_reader_reader_pool_rc, error_1146_reader_reader_pool] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_reader);
 	auto [error_1146_reader_seq_rc, error_1146_reader_seq] = sim.probe_log_last_sequence();
 	rc = rc == EXIT_SUCCESS && error_1146_reader_seq_rc == EXIT_SUCCESS ?
 		sim.topology_error({ error_1146_reader.green_writer.endpoint() }, 1146, "Table 'mysql.rds_topology' doesn't exist") : EXIT_FAILURE;
@@ -323,21 +374,28 @@ int main() {
 		error_1146_reader.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin,
 		"metadata-1146-reader", "1146 metadata", error_1146_reader_hgs.blue_writer,
 		{ error_1146_reader_hgs.blue_writer, error_1146_reader_hgs.blue_reader, error_1146_reader_hgs.green_writer, error_1146_reader_hgs.green_reader }) : rc_t<RDS_BGD_Probe_Log> { EXIT_FAILURE, {} };
-	drop_after_1146_rc = error_1146_reader_metadata_rc == EXIT_SUCCESS ? sim.topology_drop({ error_1146_reader.blue_writer.endpoint() }) : EXIT_FAILURE;
+	int error_1146_reader_none_rc = error_1146_reader_metadata_rc == EXIT_SUCCESS ? wait_for_status(admin, sim,
+		error_1146_reader_metadata.sequence_id, "metadata-1146-reader", error_1146_reader_hgs, "metadata absence", "NONE") : EXIT_FAILURE;
+	int error_1146_reader_drain_rc = error_1146_reader_none_rc == EXIT_SUCCESS ? wait_for_green_pool_drain(admin, sim,
+		error_1146_reader_metadata.sequence_id, "metadata-1146-reader", error_1146_reader_hgs, "successful cleanup") : EXIT_FAILURE;
+	auto [error_1146_reader_after_writer_rc, error_1146_reader_after_writer] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_writer);
+	auto [error_1146_reader_after_reader_rc, error_1146_reader_after_reader] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_reader);
+	drop_after_1146_rc = error_1146_reader_drain_rc == EXIT_SUCCESS ? sim.topology_drop({ error_1146_reader.blue_writer.endpoint() }) : EXIT_FAILURE;
 	const uint64_t reader_table_baseline = error_1146_reader_metadata_rc == EXIT_SUCCESS ? error_1146_reader_metadata.sequence_id : error_1146_reader_seq;
 	auto [error_1146_reader_table_rc, error_1146_reader_table] = drop_after_1146_rc == EXIT_SUCCESS ? bgd_wait_for_probe(sim, reader_table_baseline,
 		error_1146_reader.blue_writer.endpoint(), RDS_BGD_Probe_Kind::table_check, kProbeTimeoutMs, 0, admin,
-		"metadata-1146-reader", "fallback table check", error_1146_reader_hgs.blue_writer,
+		"metadata-1146-reader", "post-cleanup table check", error_1146_reader_hgs.blue_writer,
 		{ error_1146_reader_hgs.blue_writer, error_1146_reader_hgs.blue_reader, error_1146_reader_hgs.green_writer, error_1146_reader_hgs.green_reader }) : rc_t<RDS_BGD_Probe_Log> { EXIT_FAILURE, {} };
-	int error_1146_reader_none_rc = error_1146_reader_table_rc == EXIT_SUCCESS ? wait_for_status(admin, sim, error_1146_reader_table.sequence_id,
-		"metadata-1146-reader", error_1146_reader_hgs, "fallback absence", "NONE") : EXIT_FAILURE;
-	auto [error_1146_reader_after_pool_rc, error_1146_reader_after_pool] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_writer);
-	ok(pools_rc == EXIT_SUCCESS && error_1146_reader_pool_rc == EXIT_SUCCESS && error_1146_reader_pool >= 1 && rc == EXIT_SUCCESS &&
-		error_1146_reader_metadata_rc == EXIT_SUCCESS && drop_after_1146_rc == EXIT_SUCCESS && error_1146_reader_table_rc == EXIT_SUCCESS &&
-		error_1146_reader_metadata.sequence_id < error_1146_reader_table.sequence_id && error_1146_reader_none_rc == EXIT_SUCCESS &&
-		error_1146_reader_after_pool_rc == EXIT_SUCCESS && error_1146_reader_after_pool == 0 &&
-		server_has_status(admin, error_1146_reader_hgs.blue_reader, error_1146_reader.blue_readers[1], "ONLINE"),
-		"metadata error 1146 falls back to table checking and reader-switchover successful cleanup");
+	ok(pools_rc == EXIT_SUCCESS && error_1146_reader_baseline_rc == EXIT_SUCCESS &&
+		error_1146_reader_writer_pool_rc == EXIT_SUCCESS && error_1146_reader_writer_pool >= 1 &&
+		error_1146_reader_reader_pool_rc == EXIT_SUCCESS && error_1146_reader_reader_pool >= 1 && rc == EXIT_SUCCESS &&
+		error_1146_reader_metadata_rc == EXIT_SUCCESS && error_1146_reader_none_rc == EXIT_SUCCESS && error_1146_reader_drain_rc == EXIT_SUCCESS &&
+		error_1146_reader_after_writer_rc == EXIT_SUCCESS && error_1146_reader_after_writer == 0 &&
+		error_1146_reader_after_reader_rc == EXIT_SUCCESS && error_1146_reader_after_reader == 0 &&
+		server_has_status(admin, error_1146_reader_hgs.blue_reader, error_1146_reader.blue_readers[1], "ONLINE") &&
+		green_rows_remain(admin, error_1146_reader_hgs, error_1146_reader) && drop_after_1146_rc == EXIT_SUCCESS &&
+		error_1146_reader_table_rc == EXIT_SUCCESS && error_1146_reader_metadata.sequence_id < error_1146_reader_table.sequence_id,
+		"metadata error 1146 immediately performs reader cleanup, then returns to table checking");
 
 	// A non-absence metadata error must preserve the active phase and its effects.
 	RDS_BGD_Cluster generic_error = bgd_cluster_3_init();
