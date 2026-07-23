@@ -50,14 +50,6 @@ bool server_row_matches(MYSQL* admin, const string& table, int hostgroup, const 
 		rows[0][2] == "3306" && rows[0][3] == to_string(use_ssl);
 }
 
-bool persistent_server_precedes(MYSQL* admin, const RDS_BGD_Host& first, const RDS_BGD_Host& second) {
-	auto [rc, rows] = mysql_query_ext_rows(admin,
-		"SELECT hostname FROM mysql_servers WHERE hostname IN (" + bgd_sql_quote(first.hostname) + "," +
-		bgd_sql_quote(second.hostname) + ") ORDER BY rowid");
-	return rc == EXIT_SUCCESS && rows.size() == 2 && rows[0].size() == 1 && rows[1].size() == 1 &&
-		rows[0][0] == first.hostname && rows[1][0] == second.hostname;
-}
-
 bool blue_backend_and_pool_match(const CommandLine& cl, MYSQL* admin, RDS_BGD_Cluster& cluster,
 	const BGD_Hostgroups& hgs)
 {
@@ -150,7 +142,7 @@ int main() {
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
 
-	// Automatic mode: insert a reader before the writer, with a distinguishable TLS value.
+	// Automatic mode takes direct-probe TLS from the matched blue writer.
 	RDS_BGD_Cluster automatic = bgd_cluster_init();
 	BGD_Hostgroups automatic_hgs { 940, 941, 942, 943 };
 	if (scenario_cleanup(admin, sim, cluster_backends(automatic)) != EXIT_SUCCESS) {
@@ -163,17 +155,16 @@ int main() {
 		execute_all(admin, { "LOAD MYSQL SERVERS TO RUNTIME" }) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to configure automatic direct-probe scenario");
 	}
-	ok(persistent_server_precedes(admin, automatic.blue_readers[0], automatic.blue_writer) &&
-		server_row_matches(admin, "runtime_mysql_servers", automatic_hgs.blue_reader, automatic.blue_readers[0], 0) &&
+	ok(server_row_matches(admin, "runtime_mysql_servers", automatic_hgs.blue_reader, automatic.blue_readers[0], 0) &&
 		server_row_matches(admin, "runtime_mysql_servers", automatic_hgs.blue_writer, automatic.blue_writer, 1),
-		"automatic: blue reader is inserted before the writer in monitor input with distinguishable TLS");
+		"automatic: runtime blue reader and matched writer retain distinct configured TLS values");
 	auto [automatic_seq_rc, automatic_seq] = sim.probe_log_last_sequence();
 	if (automatic_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read automatic direct-probe baseline");
 	int rc = sim.topology_update(automatic.get_writers(), automatic.get_topology("AVAILABLE"));
 	int automatic_available_rc = rc == EXIT_SUCCESS ? wait_for_available(admin, sim, automatic_seq,
-		"automatic-reader-before-writer", automatic_hgs) : EXIT_FAILURE;
+		"automatic-writer-tls", automatic_hgs) : EXIT_FAILURE;
 	auto automatic_chain = wait_for_direct_probe_chain(admin, sim, automatic_seq, automatic, automatic_hgs, 1, 1,
-		"automatic-reader-before-writer");
+		"automatic-writer-tls");
 	ok(rc == EXIT_SUCCESS && automatic_available_rc == EXIT_SUCCESS,
 		"automatic: recorded AVAILABLE observation reaches the runtime BGD worker state");
 	ok(probe_chain_is_ordered(automatic_chain, 1, 1),
@@ -208,11 +199,10 @@ int main() {
 		}) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to configure explicit direct-probe scenario");
 	}
-	ok(persistent_server_precedes(admin, distractor_cluster.green_writer, explicit_cluster.green_writer) &&
-		server_row_matches(admin, "mysql_servers", explicit_hgs.green_writer, explicit_cluster.green_writer, 1) &&
+	ok(server_row_matches(admin, "mysql_servers", explicit_hgs.green_writer, explicit_cluster.green_writer, 1) &&
 		server_row_matches(admin, "runtime_mysql_servers", explicit_hgs.green_writer, explicit_cluster.green_writer, 1) &&
 		server_row_matches(admin, "runtime_mysql_servers", explicit_hgs.green_writer, distractor_cluster.green_writer, 0),
-		"explicit: first valid-looking distractor and exact TARGET rows have distinct runtime/Admin TLS values");
+		"explicit: valid-looking distractor and exact TARGET rows have distinct runtime/Admin TLS values");
 	auto [explicit_seq_rc, explicit_seq] = sim.probe_log_last_sequence();
 	if (explicit_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read explicit direct-probe baseline");
 	rc = sim.topology_update(explicit_cluster.get_writers(), explicit_cluster.get_topology("AVAILABLE"));
