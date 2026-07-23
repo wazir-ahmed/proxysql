@@ -62,14 +62,6 @@ bool server_absent(MYSQL* admin, int hostgroup, const RDS_BGD_Host& host) {
 	return rc == EXIT_SUCCESS && rows.size() == 1 && rows[0].size() == 1 && rows[0][0] == "0";
 }
 
-bool blue_placement_restored(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_BGD_Cluster& cluster) {
-	return server_has_status(admin, hgs.blue_writer, cluster.blue_writer, "ONLINE") &&
-		server_absent(admin, hgs.blue_reader, cluster.blue_writer) &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE") &&
-		server_absent(admin, hgs.blue_writer, cluster.blue_readers[0]) &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "ONLINE");
-}
-
 int wait_for_placement(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence, const string& scenario,
 	const BGD_Hostgroups& hgs, RDS_BGD_Cluster& cluster, const string& phase, bool writer_demoted)
 {
@@ -81,7 +73,9 @@ int wait_for_placement(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence, 
 		" AND hostname=" + bgd_sql_quote(cluster.blue_writer.hostname) + " AND port=3306)=" +
 		string(writer_demoted ? "1" : "0") + " AND " +
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
-		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1";
+		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[1].hostname) + " AND port=3306 AND status='ONLINE')=1";
 	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, scenario, phase,
 		writer_demoted ? "blue writer demotion" : "blue writer and readers restored", hgs.blue_writer,
 		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
@@ -115,15 +109,26 @@ int wait_for_read_only_log(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequen
 		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
 }
 
-bool automatic_row_unchanged(MYSQL* admin, const BGD_Hostgroups& hgs) {
-	auto [rc, rows] = bgd_runtime_rows(admin, hgs.blue_writer);
-	return rc == EXIT_SUCCESS && rows.size() == 1 && rows[0].size() == 6 && rows[0][2].empty() && rows[0][3].empty() &&
-		rows[0][4] == "1" && rows[0][5] == "AVAILABLE";
+rc_t<vector<mysql_res_row>> green_row_snapshot(MYSQL* admin, const string& table, int hostgroup, const RDS_BGD_Host& host) {
+	return mysql_query_ext_rows(admin, "SELECT hostgroup_id,hostname,port,status,use_ssl,weight,max_connections FROM " + table +
+		" WHERE hostgroup_id=" + to_string(hostgroup) + " AND hostname=" + bgd_sql_quote(host.hostname) + " AND port=3306");
 }
 
-bool explicit_green_rows_unchanged(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_BGD_Cluster& cluster) {
-	return server_has_status(admin, hgs.green_writer, cluster.green_writer, "ONLINE") &&
-		server_has_status(admin, hgs.green_reader, cluster.green_readers[0], "ONLINE");
+bool snapshot_unchanged(MYSQL* admin, const string& table, int hostgroup, const RDS_BGD_Host& host,
+	const vector<mysql_res_row>& expected)
+{
+	auto [rc, rows] = green_row_snapshot(admin, table, hostgroup, host);
+	return rc == EXIT_SUCCESS && rows == expected;
+}
+
+bool green_snapshots_unchanged(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_BGD_Cluster& cluster,
+	const vector<mysql_res_row>& admin_writer, const vector<mysql_res_row>& runtime_writer,
+	const vector<mysql_res_row>& admin_reader = {}, const vector<mysql_res_row>& runtime_reader = {})
+{
+	return snapshot_unchanged(admin, "mysql_servers", hgs.green_writer, cluster.green_writer, admin_writer) &&
+		snapshot_unchanged(admin, "runtime_mysql_servers", hgs.green_writer, cluster.green_writer, runtime_writer) &&
+		(admin_reader.empty() || snapshot_unchanged(admin, "mysql_servers", hgs.green_reader, cluster.green_readers[0], admin_reader)) &&
+		(runtime_reader.empty() || snapshot_unchanged(admin, "runtime_mysql_servers", hgs.green_reader, cluster.green_readers[0], runtime_reader));
 }
 
 } // namespace
@@ -139,46 +144,62 @@ int main() {
 		mysql_close(admin); BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
 
-	// Accepted cancellation from SWITCHOVER_INITIATED: automatic runtime configuration remains owned by discovery.
-	RDS_BGD_Cluster automatic = bgd_cluster_init();
-	BGD_Hostgroups automatic_hgs { 980, 981, 982, 983 };
-	vector<Endpoint> automatic_backends = topology_backends(automatic);
-	if (reset_scenario(admin, sim, automatic_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset initiated rollback scenario");
-	set_read_only(sim, automatic.blue_writer, false);
-	set_read_only(sim, automatic.green_writer, false);
-	set_read_only(sim, automatic.blue_readers[0], true);
-	set_read_only(sim, automatic.blue_readers[1], true);
-	auto [automatic_available_rc, automatic_available_seq] = sim.probe_log_last_sequence();
-	int rc = automatic_available_rc == EXIT_SUCCESS ? sim.topology_update(automatic_backends, topology_with_reader_pair(automatic, "AVAILABLE")) : EXIT_FAILURE;
-	int available_rc = rc == EXIT_SUCCESS ? bgd_admin_setup(admin, automatic, automatic_hgs, BGD_Admin_Mode::automatic,
-		{ automatic.blue_writer, automatic.blue_readers[0], automatic.blue_readers[1] }) : EXIT_FAILURE;
-	available_rc = available_rc == EXIT_SUCCESS ? wait_for_status(admin, sim, automatic_available_seq, "initiated-cancel", automatic_hgs, "available", "AVAILABLE") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && available_rc == EXIT_SUCCESS && automatic_row_unchanged(admin, automatic_hgs),
-		"automatic discovery records an AVAILABLE row with nullable green hostgroups");
+	// Accepted initiated cancellation: monitor creates this target server in an initially empty configured green HG.
+	RDS_BGD_Cluster created = bgd_cluster_init();
+	BGD_Hostgroups created_hgs { 980, 981, 982, 983 };
+	vector<Endpoint> created_backends = topology_backends(created);
+	if (reset_scenario(admin, sim, created_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset initiated rollback scenario");
+	set_read_only(sim, created.blue_writer, false);
+	set_read_only(sim, created.green_writer, false);
+	set_read_only(sim, created.blue_readers[0], true);
+	set_read_only(sim, created.blue_readers[1], true);
+	auto [created_available_rc, created_available_seq] = sim.probe_log_last_sequence();
+	int rc = created_available_rc == EXIT_SUCCESS ? sim.topology_update(created_backends, topology_with_reader_pair(created, "AVAILABLE")) : EXIT_FAILURE;
+	int available_rc = rc == EXIT_SUCCESS ? bgd_admin_setup(admin, created, created_hgs, BGD_Admin_Mode::explicit_configuration,
+		{ created.blue_writer, created.blue_readers[0], created.blue_readers[1] }) : EXIT_FAILURE;
+	available_rc = available_rc == EXIT_SUCCESS ? wait_for_status(admin, sim, created_available_seq, "initiated-cancel", created_hgs, "available", "AVAILABLE") : EXIT_FAILURE;
+	int created_green_rc = available_rc == EXIT_SUCCESS ? bgd_wait_for_condition(admin,
+		"SELECT COUNT(*)=1 FROM runtime_mysql_servers WHERE hostgroup_id=982 AND hostname=" + bgd_sql_quote(created.green_writer.hostname) + " AND port=3306",
+		kTimeoutSeconds, sim, created_available_seq, "initiated-cancel", "available", "monitor-created green writer runtime row", created_hgs.blue_writer,
+		{ created_hgs.blue_writer, created_hgs.blue_reader, created_hgs.green_writer, created_hgs.green_reader }) : EXIT_FAILURE;
+	auto [created_admin_rc, created_admin] = green_row_snapshot(admin, "mysql_servers", created_hgs.green_writer, created.green_writer);
+	auto [created_runtime_rc, created_runtime] = green_row_snapshot(admin, "runtime_mysql_servers", created_hgs.green_writer, created.green_writer);
+	ok(rc == EXIT_SUCCESS && available_rc == EXIT_SUCCESS && created_green_rc == EXIT_SUCCESS && created_admin_rc == EXIT_SUCCESS &&
+		created_runtime_rc == EXIT_SUCCESS && created_admin.empty() && created_runtime.size() == 1,
+		"AVAILABLE monitor creates the exact target green writer in runtime while Admin remains unchanged");
 
 	auto [initiated_seq_rc, initiated_seq] = sim.probe_log_last_sequence();
-	rc = initiated_seq_rc == EXIT_SUCCESS ? sim.topology_update(automatic_backends, topology_with_reader_pair(automatic, "SWITCHOVER_INITIATED")) : EXIT_FAILURE;
-	int initiated_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, initiated_seq, "initiated-cancel", automatic_hgs, "initiated", "WRITER_SWITCHOVER_INITIATED") : EXIT_FAILURE;
+	rc = initiated_seq_rc == EXIT_SUCCESS ? sim.topology_update(created_backends, topology_with_reader_pair(created, "SWITCHOVER_INITIATED")) : EXIT_FAILURE;
+	int initiated_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, initiated_seq, "initiated-cancel", created_hgs, "initiated", "WRITER_SWITCHOVER_INITIATED") : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && initiated_rc == EXIT_SUCCESS, "recorded SWITCHOVER_INITIATED enters the accepted cancellation phase");
 
-	int64_t automatic_read_only_baseline = read_only_log_time(admin, automatic.blue_readers[0]);
+	int64_t created_read_only_baseline = read_only_log_time(admin, created.blue_readers[0]);
 	auto [return_seq_rc, return_seq] = sim.probe_log_last_sequence();
-	rc = return_seq_rc == EXIT_SUCCESS ? sim.topology_update(automatic_backends, topology_with_reader_pair(automatic, "AVAILABLE")) : EXIT_FAILURE;
-	int returned_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, return_seq, "initiated-cancel", automatic_hgs, "returned available", "AVAILABLE") : EXIT_FAILURE;
-	int restored_rc = returned_rc == EXIT_SUCCESS ? wait_for_placement(admin, sim, return_seq, "initiated-cancel", automatic_hgs, automatic, "rollback placement", false) : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && returned_rc == EXIT_SUCCESS && restored_rc == EXIT_SUCCESS && automatic_row_unchanged(admin, automatic_hgs),
-		"initiated cancellation returns AVAILABLE and retains the auto-added runtime row and blue placement");
+	rc = return_seq_rc == EXIT_SUCCESS ? sim.topology_update(created_backends, topology_with_reader_pair(created, "AVAILABLE")) : EXIT_FAILURE;
+	int returned_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, return_seq, "initiated-cancel", created_hgs, "returned available", "AVAILABLE") : EXIT_FAILURE;
+	int restored_rc = returned_rc == EXIT_SUCCESS ? wait_for_placement(admin, sim, return_seq, "initiated-cancel", created_hgs, created, "rollback placement", false) : EXIT_FAILURE;
+	auto [created_probe_rc, created_probe] = bgd_wait_for_probe(sim, return_seq, created.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata,
+		kProbeTimeoutMs, 0, admin, "initiated-cancel", "returned available probe", created_hgs.blue_writer,
+		{ created_hgs.blue_writer, created_hgs.blue_reader, created_hgs.green_writer, created_hgs.green_reader });
+	ok(rc == EXIT_SUCCESS && returned_rc == EXIT_SUCCESS && restored_rc == EXIT_SUCCESS && created_probe_rc == EXIT_SUCCESS &&
+		green_snapshots_unchanged(admin, created_hgs, created, created_admin, created_runtime),
+		"initiated cancellation restores full blue placement and retains the monitor-created green writer row");
 
-	set_read_only(sim, automatic.blue_readers[0], false);
-	int unsuppressed_rc = automatic_read_only_baseline >= 0 ? wait_for_read_only_log(admin, sim, return_seq, "initiated-cancel", automatic_hgs,
-		automatic.blue_readers[0], automatic_read_only_baseline) : EXIT_FAILURE;
+	set_read_only(sim, created.blue_readers[0], false);
+	int unsuppressed_rc = created_read_only_baseline >= 0 ? wait_for_read_only_log(admin, sim, return_seq, "initiated-cancel", created_hgs,
+		created.blue_readers[0], created_read_only_baseline) : EXIT_FAILURE;
 	ok(unsuppressed_rc == EXIT_SUCCESS, "initiated rollback clears read_only suppression for a discriminating reader action");
 
-	auto [automatic_repeat_seq_rc, automatic_repeat_seq] = sim.probe_log_last_sequence();
-	rc = automatic_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(automatic_backends, topology_with_reader_pair(automatic, "AVAILABLE")) : EXIT_FAILURE;
-	int automatic_repeat_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, automatic_repeat_seq, "initiated-cancel", automatic_hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && automatic_repeat_rc == EXIT_SUCCESS && automatic_row_unchanged(admin, automatic_hgs),
-		"repeated returned AVAILABLE leaves automatic rollback effects stable");
+	auto [created_repeat_seq_rc, created_repeat_seq] = sim.probe_log_last_sequence();
+	rc = created_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(created_backends, topology_with_reader_pair(created, "AVAILABLE")) : EXIT_FAILURE;
+	int created_repeat_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, created_repeat_seq, "initiated-cancel", created_hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
+	int created_repeat_placement_rc = created_repeat_rc == EXIT_SUCCESS ? wait_for_placement(admin, sim, created_repeat_seq, "initiated-cancel", created_hgs, created, "repeat placement", false) : EXIT_FAILURE;
+	auto [created_repeat_probe_rc, created_repeat_probe] = bgd_wait_for_probe(sim, created_repeat_seq, created.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata,
+		kProbeTimeoutMs, 0, admin, "initiated-cancel", "available repeat probe", created_hgs.blue_writer,
+		{ created_hgs.blue_writer, created_hgs.blue_reader, created_hgs.green_writer, created_hgs.green_reader });
+	ok(rc == EXIT_SUCCESS && created_repeat_rc == EXIT_SUCCESS && created_repeat_placement_rc == EXIT_SUCCESS && created_repeat_probe_rc == EXIT_SUCCESS &&
+		green_snapshots_unchanged(admin, created_hgs, created, created_admin, created_runtime),
+		"repeated returned AVAILABLE preserves full placement, probe target, and monitor-created green row");
 
 	// Accepted cancellation from SWITCHOVER_IN_PROGRESS: explicit green membership and its pools are not rollback-owned.
 	RDS_BGD_Cluster explicit_cluster = bgd_cluster_2_init();
@@ -195,8 +216,14 @@ int main() {
 		{ explicit_cluster.blue_writer, explicit_cluster.blue_readers[0], explicit_cluster.blue_readers[1] },
 		{ explicit_cluster.green_writer, explicit_cluster.green_readers[0] }) : EXIT_FAILURE;
 	int explicit_available_rc = explicit_setup_rc == EXIT_SUCCESS ? wait_for_status(admin, sim, explicit_available_seq, "in-progress-cancel", explicit_hgs, "available", "AVAILABLE") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && explicit_available_rc == EXIT_SUCCESS && explicit_green_rows_unchanged(admin, explicit_hgs, explicit_cluster),
-		"explicit configuration reaches AVAILABLE with retained green rows");
+	auto [explicit_admin_writer_rc, explicit_admin_writer] = green_row_snapshot(admin, "mysql_servers", explicit_hgs.green_writer, explicit_cluster.green_writer);
+	auto [explicit_runtime_writer_rc, explicit_runtime_writer] = green_row_snapshot(admin, "runtime_mysql_servers", explicit_hgs.green_writer, explicit_cluster.green_writer);
+	auto [explicit_admin_reader_rc, explicit_admin_reader] = green_row_snapshot(admin, "mysql_servers", explicit_hgs.green_reader, explicit_cluster.green_readers[0]);
+	auto [explicit_runtime_reader_rc, explicit_runtime_reader] = green_row_snapshot(admin, "runtime_mysql_servers", explicit_hgs.green_reader, explicit_cluster.green_readers[0]);
+	ok(rc == EXIT_SUCCESS && explicit_available_rc == EXIT_SUCCESS && explicit_admin_writer_rc == EXIT_SUCCESS && explicit_runtime_writer_rc == EXIT_SUCCESS &&
+		explicit_admin_reader_rc == EXIT_SUCCESS && explicit_runtime_reader_rc == EXIT_SUCCESS && explicit_admin_writer.size() == 1 &&
+		explicit_runtime_writer.size() == 1 && explicit_admin_reader.size() == 1 && explicit_runtime_reader.size() == 1,
+		"explicit configuration snapshots pre-existing green writer and reader Admin and runtime rows");
 
 	int green_pool_setup_rc = set_default_hostgroup(admin, explicit_hgs.green_writer) == EXIT_SUCCESS ? connect_and_echo(cl).first : EXIT_FAILURE;
 	green_pool_setup_rc = green_pool_setup_rc == EXIT_SUCCESS && set_default_hostgroup(admin, explicit_hgs.green_reader) == EXIT_SUCCESS ? connect_and_echo(cl).first : EXIT_FAILURE;
@@ -225,24 +252,33 @@ int main() {
 		RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin, "in-progress-cancel", "returned available probe", explicit_hgs.blue_writer,
 		{ explicit_hgs.blue_writer, explicit_hgs.blue_reader, explicit_hgs.green_writer, explicit_hgs.green_reader });
 	ok(rc == EXIT_SUCCESS && explicit_returned_rc == EXIT_SUCCESS && explicit_restored_rc == EXIT_SUCCESS && available_probe_rc == EXIT_SUCCESS,
-		"in-progress rollback restores blue writer and reader placement and rebuilds the AVAILABLE direct probe target");
+		"in-progress rollback restores full blue placement and rebuilds the AVAILABLE direct probe target");
 
 	auto [post_writer_pool_rc, post_writer_pool] = bgd_connection_pool_count(admin, explicit_hgs.green_writer);
 	auto [post_reader_pool_rc, post_reader_pool] = bgd_connection_pool_count(admin, explicit_hgs.green_reader);
 	ok(post_writer_pool_rc == EXIT_SUCCESS && post_writer_pool >= green_writer_pool && post_reader_pool_rc == EXIT_SUCCESS &&
-		post_reader_pool >= green_reader_pool && explicit_green_rows_unchanged(admin, explicit_hgs, explicit_cluster),
-		"rollback leaves explicit green rows ONLINE and does not drain their pre-existing pools");
+		post_reader_pool >= green_reader_pool && green_snapshots_unchanged(admin, explicit_hgs, explicit_cluster,
+			explicit_admin_writer, explicit_runtime_writer, explicit_admin_reader, explicit_runtime_reader),
+		"rollback leaves explicit green rows and their pre-existing pools unchanged");
 
 	auto [blue_echo_rc, blue_echo] = connect_and_echo(cl);
 	ok(blue_echo_rc == EXIT_SUCCESS && blue_echo.find(explicit_cluster.blue_writer.ip) != string::npos,
-		"in-progress rollback removes temporary blue-to-green routing pins");
+		"returned AVAILABLE routes a new blue-writer connection to the blue backend IP");
 
 	auto [explicit_repeat_seq_rc, explicit_repeat_seq] = sim.probe_log_last_sequence();
 	rc = explicit_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(explicit_backends, topology_with_reader_pair(explicit_cluster, "AVAILABLE")) : EXIT_FAILURE;
 	int explicit_repeat_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, explicit_repeat_seq, "in-progress-cancel", explicit_hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
 	int repeat_placement_rc = explicit_repeat_rc == EXIT_SUCCESS ? wait_for_placement(admin, sim, explicit_repeat_seq, "in-progress-cancel", explicit_hgs, explicit_cluster, "repeat placement", false) : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && explicit_repeat_rc == EXIT_SUCCESS && repeat_placement_rc == EXIT_SUCCESS && explicit_green_rows_unchanged(admin, explicit_hgs, explicit_cluster),
-		"repeated returned AVAILABLE preserves rollback placement and explicit green membership");
+	auto [repeat_probe_rc, repeat_probe] = bgd_wait_for_probe(sim, explicit_repeat_seq, explicit_cluster.green_writer.endpoint(),
+		RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin, "in-progress-cancel", "available repeat probe", explicit_hgs.blue_writer,
+		{ explicit_hgs.blue_writer, explicit_hgs.blue_reader, explicit_hgs.green_writer, explicit_hgs.green_reader });
+	auto [repeat_writer_pool_rc, repeat_writer_pool] = bgd_connection_pool_count(admin, explicit_hgs.green_writer);
+	auto [repeat_reader_pool_rc, repeat_reader_pool] = bgd_connection_pool_count(admin, explicit_hgs.green_reader);
+	ok(rc == EXIT_SUCCESS && explicit_repeat_rc == EXIT_SUCCESS && repeat_placement_rc == EXIT_SUCCESS && repeat_probe_rc == EXIT_SUCCESS &&
+		repeat_writer_pool_rc == EXIT_SUCCESS && repeat_writer_pool >= green_writer_pool && repeat_reader_pool_rc == EXIT_SUCCESS &&
+		repeat_reader_pool >= green_reader_pool && green_snapshots_unchanged(admin, explicit_hgs, explicit_cluster,
+			explicit_admin_writer, explicit_runtime_writer, explicit_admin_reader, explicit_runtime_reader),
+		"repeated returned AVAILABLE preserves placement, probe routing, green rows, and green pools");
 
 	if (reset_scenario(admin, sim, explicit_backends) != EXIT_SUCCESS) diag("failed to clean rollback scenario");
 	mysql_close(admin);
