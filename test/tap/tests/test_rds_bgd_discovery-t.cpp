@@ -190,14 +190,15 @@ int main() {
 	}
 	ok(third_restart_rc == EXIT_SUCCESS,
 		"late-readers: reader-set reload replaces the pinned worker with a fresh blue-host topology check");
+	const uint64_t third_replacement_baseline =
+		third_restart_rc == EXIT_SUCCESS ? third_restart_probe.sequence_id : third_reader_seq;
 	int third_reader_probe_rc = bgd_wait_for_probe(
-		sim, third_reader_seq, third.blue_readers[0].endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1,
+		sim, third_replacement_baseline, third.blue_readers[0].endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1,
 		admin, "late-readers", "reader-set probe", third_hgs.blue_writer, { third_hgs.blue_writer, third_hgs.blue_reader });
 	ok(third_reader_probe_rc == EXIT_SUCCESS,
 		"late-readers: refreshed reader set is probed with the configured reader TLS value");
-	const uint64_t third_green_baseline = third_restart_rc == EXIT_SUCCESS ? third_restart_probe.sequence_id : third_reader_seq;
 	int third_green_probe_rc = bgd_wait_for_probe(
-		sim, third_green_baseline, third.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
+		sim, third_replacement_baseline, third.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
 		admin, "late-readers", "replacement resume", third_hgs.blue_writer, { third_hgs.blue_writer, third_hgs.blue_reader });
 	ok(third_green_probe_rc == EXIT_SUCCESS,
 		"late-readers: replacement resumes the green-writer probe after its fresh topology check");
