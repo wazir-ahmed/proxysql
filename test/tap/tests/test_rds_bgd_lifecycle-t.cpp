@@ -65,6 +65,66 @@ int wait_for_observation(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence
 	return rc;
 }
 
+int wait_for_in_progress_effects(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence,
+	RDS_BGD_Cluster& cluster, const BGD_Hostgroups& hgs)
+{
+	const RDS_BGD_Host& writer = cluster.blue_writer;
+	const RDS_BGD_Host& reader = cluster.blue_readers[0];
+	const string query = "SELECT "
+		"(SELECT COUNT(*) FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=" +
+		to_string(hgs.blue_writer) + " AND status='WRITER_SWITCHOVER_IN_PROGRESS')=1 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
+		" AND hostname=" + bgd_sql_quote(writer.hostname) + " AND port=" + to_string(writer.port) + ")=0 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(writer.hostname) + " AND port=" + to_string(writer.port) +
+		" AND status='ONLINE')=1 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(reader.hostname) + " AND port=" + to_string(reader.port) +
+		" AND status='ONLINE')=1 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
+		" AND hostname=" + bgd_sql_quote(reader.hostname) + " AND port=" + to_string(reader.port) + ")=0";
+	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, kScenario, "in-progress effects",
+		"blue-writer demotion and mapped-reader placement", hgs.blue_writer,
+		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
+}
+
+int wait_for_post_runtime_effects(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence,
+	RDS_BGD_Cluster& cluster, const BGD_Hostgroups& hgs)
+{
+	const RDS_BGD_Host& writer = cluster.blue_writer;
+	const RDS_BGD_Host& mapped_reader = cluster.blue_readers[0];
+	const RDS_BGD_Host& unmatched_reader = cluster.blue_readers[1];
+	const string query = "SELECT "
+		"(SELECT COUNT(*) FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=" +
+		to_string(hgs.blue_writer) + " AND status='WRITER_SWITCHOVER_POST_PROCESSING')=1 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
+		" AND hostname=" + bgd_sql_quote(writer.hostname) + " AND port=" + to_string(writer.port) +
+		" AND status='ONLINE')=1 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(writer.hostname) + " AND port=" + to_string(writer.port) + ")=0 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(mapped_reader.hostname) + " AND port=" + to_string(mapped_reader.port) +
+		" AND status='ONLINE')=1 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
+		" AND hostname=" + bgd_sql_quote(mapped_reader.hostname) + " AND port=" + to_string(mapped_reader.port) + ")=0 AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(unmatched_reader.hostname) + " AND port=" + to_string(unmatched_reader.port) +
+		" AND status='SHUNNED_AWS_BGD')=1";
+	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, kScenario, "post-processing effects",
+		"writer and mapped-reader placement with unmatched-reader BGD shun", hgs.blue_writer,
+		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
+}
+
+int wait_for_blue_writer_pool_drain(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence,
+	RDS_BGD_Cluster& cluster, const BGD_Hostgroups& hgs)
+{
+	const string query = "SELECT COALESCE(SUM(ConnUsed+ConnFree),0)=0 FROM stats_mysql_connection_pool WHERE srv_host=" +
+		bgd_sql_quote(cluster.blue_writer.hostname);
+	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, kScenario, "post-processing pool drain",
+		"mapped blue-writer connection pool drained", hgs.blue_writer,
+		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
+}
+
 bool server_has_status(MYSQL* admin, int hostgroup, const RDS_BGD_Host& host, const string& status) {
 	auto [rc, rows] = mysql_query_ext_rows(admin,
 		"SELECT status FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hostgroup) +
@@ -86,14 +146,6 @@ bool writer_in_expected_placement(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_B
 		: server_absent(admin, hgs.blue_writer, cluster.blue_writer)) &&
 		(in_reader ? server_has_status(admin, hgs.blue_reader, cluster.blue_writer, "ONLINE")
 		: server_absent(admin, hgs.blue_reader, cluster.blue_writer));
-}
-
-int64_t pool_count_for_host(MYSQL* admin, const string& hostname) {
-	auto [rc, rows] = mysql_query_ext_rows(admin,
-		"SELECT COALESCE(SUM(ConnUsed+ConnFree),0) FROM stats_mysql_connection_pool WHERE srv_host=" +
-		bgd_sql_quote(hostname));
-	if (rc != EXIT_SUCCESS || rows.size() != 1 || rows[0].size() != 1) return -1;
-	return strtoll(rows[0][0].c_str(), nullptr, 10);
 }
 
 int64_t last_read_only_log_time(MYSQL* admin, const RDS_BGD_Host& host) {
@@ -192,7 +244,9 @@ int main() {
 	auto [available_repeat_seq_rc, available_repeat_seq] = sim.probe_log_last_sequence();
 	rc = available_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "AVAILABLE")) : EXIT_FAILURE;
 	int available_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, available_repeat_seq, cluster, hgs, "available repeat") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && available_repeat_rc == EXIT_SUCCESS &&
+	int available_repeat_status_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(admin, sim, available_repeat_seq, hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && available_repeat_rc == EXIT_SUCCESS && available_repeat_status_rc == EXIT_SUCCESS &&
 		writer_in_expected_placement(admin, hgs, cluster, true, false),
 		"repeated AVAILABLE observation preserves status and writer placement");
 
@@ -230,9 +284,9 @@ int main() {
 	ok(rc == EXIT_SUCCESS && progress_rc == EXIT_SUCCESS,
 		"recorded SWITCHOVER_IN_PROGRESS observation enters in-progress runtime status");
 
-	ok(writer_in_expected_placement(admin, hgs, cluster, false, true) &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE") &&
-		server_absent(admin, hgs.blue_writer, cluster.blue_readers[0]),
+	int progress_effects_rc = progress_rc == EXIT_SUCCESS ?
+		wait_for_in_progress_effects(admin, sim, progress_seq, cluster, hgs) : EXIT_FAILURE;
+	ok(progress_effects_rc == EXIT_SUCCESS,
 		"in-progress policy demotes the mapped blue writer while suppression keeps the blue reader placed");
 
 	auto [progress_suppression_seq_rc, progress_suppression_seq] = sim.probe_log_last_sequence();
@@ -257,12 +311,14 @@ int main() {
 	ok(rc == EXIT_SUCCESS && post_rc == EXIT_SUCCESS,
 		"recorded SWITCHOVER_IN_POST_PROCESSING observation enters post-processing runtime status");
 
-	ok(writer_in_expected_placement(admin, hgs, cluster, true, false) &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE") &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "SHUNNED_AWS_BGD"),
+	int post_runtime_effects_rc = post_rc == EXIT_SUCCESS ?
+		wait_for_post_runtime_effects(admin, sim, post_seq, cluster, hgs) : EXIT_FAILURE;
+	ok(post_runtime_effects_rc == EXIT_SUCCESS,
 		"post-processing restores writer placement and shuns the unmatched blue reader");
 
-	ok(pool_count_for_host(admin, cluster.blue_writer.hostname) == 0,
+	int post_pool_drain_rc = post_runtime_effects_rc == EXIT_SUCCESS ?
+		wait_for_blue_writer_pool_drain(admin, sim, post_seq, cluster, hgs) : EXIT_FAILURE;
+	ok(post_pool_drain_rc == EXIT_SUCCESS,
 		"post-processing drains existing pools for the mapped blue writer hostname");
 
 	auto [post_echo_rc, post_echo] = connect_and_echo(cl);
