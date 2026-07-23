@@ -100,6 +100,23 @@ bool writer_placement(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_BGD_Cluster& 
 		: server_absent(admin, hgs.blue_reader, cluster.blue_writer));
 }
 
+int wait_for_in_progress_placement(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence,
+	const string& scenario, const BGD_Hostgroups& hgs, RDS_BGD_Cluster& cluster, const string& phase)
+{
+	const string query = "SELECT "
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
+		" AND hostname=" + bgd_sql_quote(cluster.blue_writer.hostname) + " AND port=3306)=0 AND "
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(cluster.blue_writer.hostname) + " AND port=3306 AND status='ONLINE')=1 AND "
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1 AND "
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
+		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[0].hostname) + " AND port=3306)=0";
+	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, scenario, phase,
+		"blue writer demoted to reader placement with mapped reader retained", hgs.blue_writer,
+		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
+}
+
 int64_t last_read_only_log_time(MYSQL* admin, const RDS_BGD_Host& host) {
 	auto [rc, rows] = mysql_query_ext_rows(admin,
 		"SELECT COALESCE(MAX(time_start_us),0) FROM mysql_server_read_only_log WHERE hostname=" +
@@ -280,8 +297,10 @@ int main() {
 		"fresh-in-progress", progress_hgs, "first observation", "WRITER_SWITCHOVER_IN_PROGRESS") : EXIT_FAILURE;
 	int progress_probe_rc = progress_status_rc == EXIT_SUCCESS ? wait_for_green_metadata(admin, sim, progress_publish_seq,
 		"fresh-in-progress", progress, progress_hgs, "first observation") : EXIT_FAILURE;
+	int progress_effects_rc = progress_probe_rc == EXIT_SUCCESS ? wait_for_in_progress_placement(admin, sim, progress_publish_seq,
+		"fresh-in-progress", progress_hgs, progress, "first observation effects") : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && progress_setup_rc == EXIT_SUCCESS && progress_status_rc == EXIT_SUCCESS && progress_probe_rc == EXIT_SUCCESS &&
-		writer_placement(admin, progress_hgs, progress, false, true),
+		progress_effects_rc == EXIT_SUCCESS,
 		"fresh in-progress observation builds prerequisites before demoting the blue writer");
 
 	int64_t progress_reader_log = last_read_only_log_time(admin, progress.blue_readers[0]);
@@ -302,7 +321,7 @@ int main() {
 		"fresh-in-progress", progress, progress_hgs, "repeat") : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && progress_repeat_rc == EXIT_SUCCESS &&
 		wait_for_status(admin, sim, progress_repeat_seq, "fresh-in-progress", progress_hgs, "repeat", "WRITER_SWITCHOVER_IN_PROGRESS") == EXIT_SUCCESS &&
-		writer_placement(admin, progress_hgs, progress, false, true),
+		wait_for_in_progress_placement(admin, sim, progress_repeat_seq, "fresh-in-progress", progress_hgs, progress, "repeat effects") == EXIT_SUCCESS,
 		"repeated fresh in-progress observation preserves the direct-entry demotion");
 
 	auto [progress_empty_seq_rc, progress_empty_seq] = sim.probe_log_last_sequence();
@@ -373,8 +392,9 @@ int main() {
 		"fresh-post-processing", post, post_hgs, "repeat") : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && post_repeat_rc == EXIT_SUCCESS &&
 		wait_for_status(admin, sim, post_repeat_seq, "fresh-post-processing", post_hgs, "repeat", "WRITER_SWITCHOVER_POST_PROCESSING") == EXIT_SUCCESS &&
+		writer_placement(admin, post_hgs, post, true, false) &&
 		server_has_status(admin, post_hgs.blue_reader, post.blue_readers[1], "SHUNNED_AWS_BGD"),
-		"repeated fresh post-processing observation preserves pins, placement, and reader shun");
+		"repeated fresh post-processing observation preserves writer placement and reader shun");
 
 	auto [post_empty_seq_rc, post_empty_seq] = sim.probe_log_last_sequence();
 	rc = post_empty_seq_rc == EXIT_SUCCESS ? sim.topology_delete(post_backends) : EXIT_FAILURE;
@@ -413,9 +433,12 @@ int main() {
 	if (completed_no_green_rc != ETIMEDOUT) {
 		diag("fresh-completed: green metadata negative check returned rc=%d", completed_no_green_rc);
 	}
-	ok(completed_no_green_rc == ETIMEDOUT && writer_placement(admin, completed_hgs, completed, true, false) &&
+	auto [completed_echo_rc, completed_echo] = completed_no_green_rc == ETIMEDOUT ?
+		connect_and_echo(cl) : rc_t<string> { EXIT_FAILURE, {} };
+	ok(completed_no_green_rc == ETIMEDOUT && completed_echo_rc == EXIT_SUCCESS &&
+		completed_echo.find(completed.blue_writer.ip) != string::npos && writer_placement(admin, completed_hgs, completed, true, false) &&
 		server_has_status(admin, completed_hgs.blue_reader, completed.blue_readers[1], "ONLINE"),
-		"fresh completed does not reconstruct earlier direct-green map, demotion, pin, or reader-shun effects");
+		"fresh completed does not reconstruct earlier direct-green map, blue pin, demotion, or reader-shun effects");
 
 	auto [completed_repeat_seq_rc, completed_repeat_seq] = sim.probe_log_last_sequence();
 	rc = completed_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(completed_backends,
