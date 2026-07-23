@@ -119,6 +119,17 @@ bool persistent_row_absent(MYSQL* admin, int writer_hg) {
 	return rc == EXIT_SUCCESS && rows.size() == 1 && rows[0].size() == 1 && rows[0][0] == "0";
 }
 
+void diag_unexpected_probe(const string& scenario, int rc, const RDS_BGD_Probe_Log& probe) {
+	if (rc == ETIMEDOUT) return;
+	if (rc != EXIT_SUCCESS) {
+		diag("%s: negative worker-probe check returned rc=%d", scenario.c_str(), rc);
+		return;
+	}
+	diag("%s: unexpected BGD probe sequence=%llu backend=%s:%d kind=%s", scenario.c_str(),
+		static_cast<unsigned long long>(probe.sequence_id), probe.backend.host.c_str(), probe.backend.port,
+		probe.probe_kind == RDS_BGD_Probe_Kind::table_check ? "table_check" : "metadata");
+}
+
 int add_all_servers(MYSQL* admin, const RDS_BGD_Cluster& cluster, const BGD_Hostgroups& hgs) {
 	return bgd_admin_add_servers(admin, cluster, hgs,
 		{ cluster.blue_writer, cluster.blue_readers[0], cluster.blue_readers[1] }, false, 0) == EXIT_SUCCESS &&
@@ -186,8 +197,9 @@ int main() {
 	if (first_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read explicit-before-servers probe baseline");
 	ok(explicit_runtime_row_matches(admin, first_hgs),
 		"explicit-before-servers: runtime row records both configured green hostgroups with auto_generated=0");
-	auto [first_no_probe_rc, first_no_probe] = bgd_wait_for_any_probe_from_backends(
-		sim, first_seq, cluster_backends(first), kNoProbeTimeoutMs);
+	auto [first_no_probe_rc, first_no_probe] = bgd_wait_for_probe_from_backends(
+		sim, first_seq, cluster_backends(first), RDS_BGD_Probe_Kind::table_check, kNoProbeTimeoutMs);
+	diag_unexpected_probe("explicit-before-servers", first_no_probe_rc, first_no_probe);
 	ok(first_no_probe_rc == ETIMEDOUT,
 		"explicit-before-servers: no BGD worker probe starts before an eligible blue server exists");
 	rc = add_all_servers(admin, first, first_hgs);
@@ -215,6 +227,7 @@ int main() {
 	if (second_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read servers-before-explicit probe baseline");
 	auto [second_no_probe_rc, second_no_probe] = bgd_wait_for_probe_from_backends(
 		sim, second_seq, cluster_backends(second), RDS_BGD_Probe_Kind::table_check, kNoProbeTimeoutMs);
+	diag_unexpected_probe("servers-before-explicit", second_no_probe_rc, second_no_probe);
 	ok(second_no_probe_rc == ETIMEDOUT,
 		"servers-before-explicit: configured blue and green servers do not start the BGD worker before the explicit row loads");
 	rc = insert_explicit_row(admin, second_hgs, "servers before explicit row");
@@ -371,13 +384,29 @@ int main() {
 		execute_all(admin, { "LOAD MYSQL SERVERS TO RUNTIME" }) != EXIT_SUCCESS) BAIL_OUT("failed to configure SAVE scenario");
 	auto [save_seq_rc, save_seq] = sim.probe_log_last_sequence();
 	if (save_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read SAVE scenario probe baseline");
-	rc = bgd_wait_for_condition(admin,
+	int automatic_runtime_rc = bgd_wait_for_condition(admin,
 		"SELECT COUNT(*)=1 FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=930 AND auto_generated=1",
 		kTimeoutSeconds, sim, save_seq, "save-from-runtime", "automatic discovery", "automatic runtime row",
 		automatic_save_hgs.blue_writer, { automatic_save_hgs.blue_writer, automatic_save_hgs.blue_reader });
-	if (rc == EXIT_SUCCESS) rc = execute_all(admin, { "SAVE MYSQL SERVERS FROM RUNTIME" });
-	ok(rc == EXIT_SUCCESS && persistent_row_matches(admin, explicit_save_hgs) && persistent_row_absent(admin, automatic_save_hgs.blue_writer),
-		"save-from-runtime: SAVE MYSQL SERVERS FROM RUNTIME retains explicit BGD rows and skips automatic rows");
+	int explicit_runtime_rc = bgd_wait_for_condition(admin,
+		"SELECT COUNT(*)=1 FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=920 "
+		"AND auto_generated=0 AND green_writer_hostgroup=922 AND green_reader_hostgroup=923",
+		kTimeoutSeconds, sim, save_seq, "save-from-runtime", "explicit runtime row", "explicit runtime row before persistence reset",
+		explicit_save_hgs.blue_writer, { explicit_save_hgs.blue_writer, explicit_save_hgs.blue_reader,
+			explicit_save_hgs.green_writer, explicit_save_hgs.green_reader });
+	int delete_explicit_rc = EXIT_FAILURE;
+	bool explicit_absent_before_save = false;
+	int save_rc = EXIT_FAILURE;
+	if (automatic_runtime_rc == EXIT_SUCCESS && explicit_runtime_rc == EXIT_SUCCESS) {
+		delete_explicit_rc = mysql_query(admin,
+			"DELETE FROM mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=" + to_string(explicit_save_hgs.blue_writer));
+		explicit_absent_before_save = delete_explicit_rc == 0 && persistent_row_absent(admin, explicit_save_hgs.blue_writer);
+		if (explicit_absent_before_save) save_rc = execute_all(admin, { "SAVE MYSQL SERVERS FROM RUNTIME" });
+	}
+	ok(automatic_runtime_rc == EXIT_SUCCESS && explicit_runtime_rc == EXIT_SUCCESS && delete_explicit_rc == 0 &&
+		explicit_absent_before_save && save_rc == EXIT_SUCCESS && persistent_row_matches(admin, explicit_save_hgs) &&
+		persistent_row_absent(admin, automatic_save_hgs.blue_writer),
+		"save-from-runtime: SAVE recreates the missing explicit BGD row and skips the automatic runtime row");
 
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS) diag("failed to clean final BGD TAP Admin state");
 	mysql_close(admin);

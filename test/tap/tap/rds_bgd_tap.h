@@ -295,24 +295,6 @@ inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe_from_backends(
 	return { ETIMEDOUT, {} };
 }
 
-inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_any_probe_from_backends(
-	RDS_BGD_Simulator& sim, uint64_t sequence, const vector<Endpoint>& backends,
-	uint32_t timeout_ms)
-{
-	const uint64_t deadline = monotonic_time() + static_cast<uint64_t>(timeout_ms) * 1000;
-	do {
-		auto [rc, logs] = sim.probe_log_since(sequence);
-		if (rc != EXIT_SUCCESS) return { EXIT_FAILURE, {} };
-		for (const RDS_BGD_Probe_Log& log : logs) {
-			for (const Endpoint& backend : backends) {
-				if (log.backend.host == backend.host && log.backend.port == backend.port) return { EXIT_SUCCESS, log };
-			}
-		}
-		usleep(50000);
-	} while (monotonic_time() < deadline);
-	return { ETIMEDOUT, {} };
-}
-
 inline int execute_all(MYSQL* admin, vector<string> queries) {
 	for (string& query : queries) {
 		if (mysql_query(admin, query.c_str()) != 0) {
