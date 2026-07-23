@@ -14,6 +14,7 @@
 namespace {
 
 const uint32_t kTimeoutSeconds = 3;
+const uint32_t kProbeTimeoutMs = 3000;
 
 struct Green_Server {
 	int hostgroup;
@@ -153,6 +154,45 @@ int load_servers(MYSQL* admin) {
 	return execute_all(admin, { "LOAD MYSQL SERVERS TO RUNTIME" });
 }
 
+int configure_inactive_explicit_ownership(MYSQL* admin, const RDS_BGD_Cluster& cluster,
+	const BGD_Hostgroups& hgs)
+{
+	if (execute_all(admin, {
+			"SET mysql-monitor_enabled='false'",
+			"LOAD MYSQL VARIABLES TO RUNTIME",
+			"INSERT INTO mysql_replication_hostgroups(writer_hostgroup,reader_hostgroup) VALUES (" +
+				to_string(hgs.blue_writer) + "," + to_string(hgs.blue_reader) + ")",
+			"SET mysql-monitor_username='testuser'",
+			"SET mysql-monitor_password='testuser'",
+			"SET mysql-monitor_read_only_interval=100",
+			"SET mysql-monitor_aws_rds_topology_discovery_interval=1",
+			"SET mysql-aws_blue_green_deployment_auto_discovery='false'",
+			"UPDATE mysql_users SET default_hostgroup=" + to_string(hgs.blue_writer) +
+				" WHERE username='testuser'",
+			"INSERT INTO mysql_aws_rds_bgd_hostgroups("
+				"writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup,"
+				"active,writer_is_also_reader,check_interval_ms,check_timeout_ms,comment) VALUES (" +
+				to_string(hgs.blue_writer) + "," + to_string(hgs.blue_reader) + "," +
+				to_string(hgs.green_writer) + "," + to_string(hgs.green_reader) +
+				",0,0,100,800,'BGD TAP administrator-owned inactive configuration')",
+		}) != EXIT_SUCCESS ||
+		bgd_admin_add_servers(admin, cluster, hgs,
+			{ cluster.blue_writer, cluster.blue_readers[0] }, false, 0) != EXIT_SUCCESS ||
+		bgd_admin_add_servers(admin, cluster, hgs, { cluster.green_writer }, true, 0) != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+	return execute_all(admin, {
+		"UPDATE mysql_servers SET status='SHUNNED' WHERE hostgroup_id=" +
+			to_string(hgs.green_writer) + " AND hostname=" +
+			bgd_sql_quote(cluster.green_writer.hostname) + " AND port=3306",
+		"LOAD MYSQL USERS TO RUNTIME",
+		"LOAD MYSQL SERVERS TO RUNTIME",
+		"SET mysql-aws_blue_green_deployment_auto_discovery='true'",
+		"SET mysql-monitor_enabled='true'",
+		"LOAD MYSQL VARIABLES TO RUNTIME",
+	});
+}
+
 bool configured_green_statuses_match(MYSQL* admin, const vector<Green_Server>& servers) {
 	for (const Green_Server& server : servers) {
 		if (server.status == "OFFLINE_HARD") {
@@ -248,12 +288,14 @@ int main() {
 	BGD_Hostgroups fallback_hgs { 1290, 1291, 1292, 1293 };
 	vector<Endpoint> fallback_backends = scenario_backends(fallback);
 	fallback_backends.push_back(fallback_extra.blue_readers[0].endpoint());
+	fallback_backends.push_back(fallback_extra.green_readers[0].endpoint());
 	if (reset_scenario(admin, sim, fallback_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset offline fallback scenario");
 	set_writers_writable(sim, fallback);
 	if (bgd_admin_setup(admin, fallback, fallback_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ fallback.blue_writer, fallback.blue_readers[0], fallback.blue_readers[1] },
-		{ fallback.green_writer, fallback.green_readers[0] }) != EXIT_SUCCESS ||
+		{ fallback.green_writer, fallback.green_readers[0], fallback.green_readers[1] }) != EXIT_SUCCESS ||
 		bgd_admin_add_servers(admin, fallback, fallback_hgs, { fallback_extra.blue_readers[0] }, false, 0) != EXIT_SUCCESS ||
+		bgd_admin_add_servers(admin, fallback_extra, fallback_hgs, { fallback_extra.green_readers[0] }, true, 0) != EXIT_SUCCESS ||
 		execute_all(admin, {
 			"UPDATE mysql_servers SET status='OFFLINE_SOFT' WHERE hostgroup_id=1291 AND hostname=" +
 				bgd_sql_quote(fallback.blue_readers[1].hostname) + " AND port=3306",
@@ -266,8 +308,16 @@ int main() {
 		BAIL_OUT("failed to configure offline fallback server states");
 	}
 	auto [fallback_seq_rc, fallback_seq] = sim.probe_log_last_sequence();
+	vector<RDS_BGD_Topology_Row> fallback_topology =
+		topology_with_reader_pairs(fallback, "SWITCHOVER_IN_POST_PROCESSING", 2);
+	fallback_topology.push_back({ fallback_extra.blue_readers[0].hostname,
+		fallback_extra.blue_readers[0].hostname, 3306, "BLUE_GREEN_DEPLOYMENT_SOURCE",
+		"SWITCHOVER_IN_POST_PROCESSING" });
+	fallback_topology.push_back({ fallback_extra.green_readers[0].hostname,
+		fallback_extra.green_readers[0].hostname, 3306, "BLUE_GREEN_DEPLOYMENT_TARGET",
+		"SWITCHOVER_IN_POST_PROCESSING" });
 	rc = fallback_seq_rc == EXIT_SUCCESS ?
-		sim.topology_update(fallback_backends, topology_with_reader_pairs(fallback, "SWITCHOVER_IN_POST_PROCESSING", 1)) : EXIT_FAILURE;
+		sim.topology_update(fallback_backends, fallback_topology) : EXIT_FAILURE;
 	int fallback_post_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, fallback_seq,
 		"offline-fallback", fallback_hgs, "post processing", "WRITER_SWITCHOVER_POST_PROCESSING") : EXIT_FAILURE;
 	int fallback_effects_rc = fallback_post_rc == EXIT_SUCCESS ? bgd_wait_for_condition(admin,
@@ -281,40 +331,43 @@ int main() {
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1291 AND hostname=" +
 		bgd_sql_quote(fallback.blue_writer.hostname) + " AND port=3306 AND status='ONLINE')=1 AND "
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1293 AND hostname=" +
-		bgd_sql_quote(fallback.green_readers[0].hostname) + " AND port=3306)=0",
+		bgd_sql_quote(fallback.green_readers[0].hostname) + " AND port=3306)=0 AND "
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1293 AND hostname=" +
+		bgd_sql_quote(fallback.green_readers[1].hostname) + " AND port=3306 AND status='ONLINE')=1 AND "
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1293 AND hostname=" +
+		bgd_sql_quote(fallback_extra.green_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1",
 		kTimeoutSeconds, sim, fallback_seq, "offline-fallback", "post processing",
 		"only eligible unmatched reader shunned, offline blue rows excluded, writer fallback retained", fallback_hgs.blue_writer,
 		{ fallback_hgs.blue_writer, fallback_hgs.blue_reader, fallback_hgs.green_writer, fallback_hgs.green_reader }) : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && fallback_effects_rc == EXIT_SUCCESS &&
 		persistent_server_has_status(admin, fallback_hgs.blue_reader, fallback_extra.blue_readers[0], "OFFLINE_HARD") &&
-		persistent_server_has_status(admin, fallback_hgs.green_reader, fallback.green_readers[0], "OFFLINE_HARD"),
-		"offline-fallback: OFFLINE_SOFT/HARD blue rows are untouched and an ineligible green counterpart triggers the accepted writer fallback");
+		persistent_server_has_status(admin, fallback_hgs.green_reader, fallback.green_readers[0], "OFFLINE_HARD") &&
+		persistent_server_has_status(admin, fallback_hgs.green_reader, fallback.green_readers[1], "ONLINE") &&
+		persistent_server_has_status(admin, fallback_hgs.green_reader, fallback_extra.green_readers[0], "ONLINE"),
+		"offline-fallback: matched OFFLINE_SOFT/HARD blue rows are excluded, so the sole eligible unmatched reader triggers writer fallback");
 
-	// The cleanup matrix covers one persistent green row per status.  Each row first receives
-	// an isolated pool while ONLINE; the post-status pool values are the causal pre-cleanup
-	// baselines used to distinguish BGD cleanup from status-transition side effects.
+	// The cleanup matrix covers one persistent green row per public status.  A separate
+	// ONLINE router row creates an isolated pool after each target status is loaded, making
+	// every pre-cleanup value a causal baseline for the BGD cleanup policy.
 	RDS_BGD_Cluster matrix = bgd_cluster_3_init();
 	RDS_BGD_Cluster matrix_extra = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups matrix_hgs { 1300, 1301, 1302, 1303 };
 	vector<Endpoint> matrix_backends = scenario_backends(matrix);
 	matrix_backends.push_back(matrix_extra.green_readers[0].endpoint());
-	matrix_backends.push_back(matrix_extra.green_readers[1].endpoint());
 	if (reset_scenario(admin, sim, matrix_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset green drain matrix scenario");
 	set_writers_writable(sim, matrix);
 	if (bgd_admin_setup(admin, matrix, matrix_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ matrix.blue_writer, matrix.blue_readers[0], matrix.blue_readers[1] },
 		{ matrix.green_writer, matrix.green_readers[0], matrix.green_readers[1] }) != EXIT_SUCCESS ||
 		add_green_server(admin, matrix_hgs.green_reader, matrix_extra.green_readers[0], "ONLINE") != EXIT_SUCCESS ||
-		add_green_server(admin, matrix_hgs.green_reader, matrix_extra.green_readers[1], "ONLINE") != EXIT_SUCCESS ||
 		load_servers(admin) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to configure green drain status matrix");
 	}
 	vector<Green_Server> matrix_servers {
 		{ matrix_hgs.green_writer, matrix.green_writer, "ONLINE" },
 		{ matrix_hgs.green_reader, matrix.green_readers[0], "SHUNNED" },
-		{ matrix_hgs.green_reader, matrix.green_readers[1], "SHUNNED" },
-		{ matrix_hgs.green_reader, matrix_extra.green_readers[0], "OFFLINE_SOFT" },
-		{ matrix_hgs.green_reader, matrix_extra.green_readers[1], "OFFLINE_HARD" },
+		{ matrix_hgs.green_reader, matrix.green_readers[1], "OFFLINE_SOFT" },
+		{ matrix_hgs.green_reader, matrix_extra.green_readers[0], "OFFLINE_HARD" },
 	};
 	const int matrix_router_base_hg = 1350;
 	for (size_t i = 0; i < matrix_servers.size(); ++i) {
@@ -327,40 +380,34 @@ int main() {
 	auto [matrix_initial_runtime_rc, matrix_initial_runtime] = green_snapshot(admin, "runtime_mysql_servers", matrix_hgs);
 	ok(matrix_initial_admin_rc == EXIT_SUCCESS && matrix_initial_runtime_rc == EXIT_SUCCESS &&
 		matrix_initial_admin.size() == matrix_servers.size() && matrix_initial_runtime.size() == matrix_servers.size(),
-		"green-drain-matrix: all five configured green rows exist before status-specific pool baselines");
-
-	int matrix_pool_setup_rc = EXIT_SUCCESS;
-	for (size_t i = 0; i < matrix_servers.size() && matrix_pool_setup_rc == EXIT_SUCCESS; ++i) {
-		matrix_pool_setup_rc = create_pool(cl, admin, matrix_router_base_hg + static_cast<int>(i));
-	}
-	if (restore_blue_default_hostgroup(admin, matrix_hgs) != EXIT_SUCCESS) matrix_pool_setup_rc = EXIT_FAILURE;
-	vector<int64_t> matrix_before_status {};
-	for (const Green_Server& server : matrix_servers) {
-		auto [pool_rc, pool] = pool_for_hostname(admin, server.host.hostname);
-		if (pool_rc != EXIT_SUCCESS) matrix_pool_setup_rc = EXIT_FAILURE;
-		matrix_before_status.push_back(pool);
-	}
-	ok(matrix_pool_setup_rc == EXIT_SUCCESS && matrix_before_status.size() == matrix_servers.size() &&
-		matrix_before_status[0] >= 1 && matrix_before_status[1] >= 1 && matrix_before_status[2] >= 1 &&
-		matrix_before_status[3] >= 1 && matrix_before_status[4] >= 1,
-		"green-drain-matrix: every eventual status has a causal established pool before its status changes");
+		"green-drain-matrix: all four publicly configurable green statuses have dedicated rows");
 
 	int matrix_status_rc = EXIT_SUCCESS;
 	for (const Green_Server& server : matrix_servers) {
 		if (set_server_status(admin, server, server.status) != EXIT_SUCCESS) matrix_status_rc = EXIT_FAILURE;
 	}
 	if (matrix_status_rc == EXIT_SUCCESS) matrix_status_rc = load_servers(admin);
-	vector<int64_t> matrix_pre_cleanup {};
-	for (const Green_Server& server : matrix_servers) {
-		auto [pool_rc, pool] = pool_for_hostname(admin, server.host.hostname);
-		if (pool_rc != EXIT_SUCCESS) matrix_status_rc = EXIT_FAILURE;
-		matrix_pre_cleanup.push_back(pool);
-	}
 	auto [matrix_admin_snapshot_rc, matrix_admin_snapshot] = green_snapshot(admin, "mysql_servers", matrix_hgs);
 	auto [matrix_runtime_snapshot_rc, matrix_runtime_snapshot] = green_snapshot(admin, "runtime_mysql_servers", matrix_hgs);
 	ok(matrix_status_rc == EXIT_SUCCESS && configured_green_statuses_match(admin, matrix_servers) &&
 		matrix_admin_snapshot_rc == EXIT_SUCCESS && matrix_runtime_snapshot_rc == EXIT_SUCCESS,
-		"green-drain-matrix: status-transition pool baselines and exact persistent/runtime row snapshots are recorded before cleanup");
+		"green-drain-matrix: ONLINE, SHUNNED, OFFLINE_SOFT, and OFFLINE_HARD rows match exact snapshots");
+
+	int matrix_pool_setup_rc = EXIT_SUCCESS;
+	for (size_t i = 0; i < matrix_servers.size() && matrix_pool_setup_rc == EXIT_SUCCESS; ++i) {
+		matrix_pool_setup_rc = create_pool(cl, admin, matrix_router_base_hg + static_cast<int>(i));
+	}
+	if (restore_blue_default_hostgroup(admin, matrix_hgs) != EXIT_SUCCESS) matrix_pool_setup_rc = EXIT_FAILURE;
+	vector<int64_t> matrix_pre_cleanup {};
+	for (const Green_Server& server : matrix_servers) {
+		auto [pool_rc, pool] = pool_for_hostname(admin, server.host.hostname);
+		if (pool_rc != EXIT_SUCCESS) matrix_pool_setup_rc = EXIT_FAILURE;
+		matrix_pre_cleanup.push_back(pool);
+	}
+	ok(matrix_pool_setup_rc == EXIT_SUCCESS && matrix_pre_cleanup.size() == matrix_servers.size() &&
+		matrix_pre_cleanup[0] >= 1 && matrix_pre_cleanup[1] >= 1 &&
+		matrix_pre_cleanup[2] >= 1 && matrix_pre_cleanup[3] >= 1,
+		"green-drain-matrix: every status has a nonzero causal pool immediately before cleanup");
 
 	auto [matrix_available_seq_rc, matrix_available_seq] = sim.probe_log_last_sequence();
 	rc = matrix_available_seq_rc == EXIT_SUCCESS ?
@@ -391,10 +438,10 @@ int main() {
 		matrix_after_cleanup.push_back(pool);
 	}
 	ok(rc == EXIT_SUCCESS && matrix_none_rc == EXIT_SUCCESS && matrix_after_cleanup.size() == matrix_servers.size() &&
-		matrix_after_cleanup[0] == 0 && matrix_after_cleanup[1] == 0 && matrix_after_cleanup[2] == 0,
-		"green-drain-matrix: successful cleanup drains ONLINE, SHUNNED, and SHUNNED_AWS_BGD green pools");
+		matrix_after_cleanup[0] == 0 && matrix_after_cleanup[1] == 0,
+		"green-drain-matrix: successful cleanup drains every eligible non-offline green pool");
 	ok(matrix_none_rc == EXIT_SUCCESS && matrix_pre_cleanup.size() == matrix_servers.size() &&
-		matrix_after_cleanup[3] == matrix_pre_cleanup[3] && matrix_after_cleanup[4] == matrix_pre_cleanup[4],
+		matrix_after_cleanup[2] == matrix_pre_cleanup[2] && matrix_after_cleanup[3] == matrix_pre_cleanup[3],
 		"green-drain-matrix: successful cleanup leaves OFFLINE_SOFT and OFFLINE_HARD green pool baselines untouched");
 	ok(matrix_none_rc == EXIT_SUCCESS && snapshots_unchanged(admin, matrix_hgs,
 		matrix_admin_snapshot, matrix_runtime_snapshot),
@@ -406,15 +453,7 @@ int main() {
 	vector<Endpoint> automatic_backends = scenario_backends(automatic);
 	if (reset_scenario(admin, sim, automatic_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset automatic ownership scenario");
 	set_writers_writable(sim, automatic);
-	if (bgd_admin_setup(admin, automatic, automatic_hgs, BGD_Admin_Mode::explicit_configuration,
-		{ automatic.blue_writer, automatic.blue_readers[0] }, { automatic.green_writer }) != EXIT_SUCCESS ||
-		execute_all(admin, {
-			"UPDATE mysql_servers SET status='SHUNNED' WHERE hostgroup_id=1312 AND hostname=" +
-				bgd_sql_quote(automatic.green_writer.hostname) + " AND port=3306",
-			"SET mysql-aws_blue_green_deployment_auto_discovery='true'",
-			"LOAD MYSQL VARIABLES TO RUNTIME",
-			"LOAD MYSQL SERVERS TO RUNTIME",
-		}) != EXIT_SUCCESS) {
+	if (configure_inactive_explicit_ownership(admin, automatic, automatic_hgs) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to configure automatic ownership scenario");
 	}
 	auto [automatic_admin_snapshot_rc, automatic_admin_snapshot] = green_snapshot(admin, "mysql_servers", automatic_hgs);
@@ -423,12 +462,17 @@ int main() {
 		"SELECT writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup,active,writer_is_also_reader,check_interval_ms,check_timeout_ms,comment FROM mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=1310");
 	auto [automatic_seq_rc, automatic_seq] = sim.probe_log_last_sequence();
 	rc = automatic_seq_rc == EXIT_SUCCESS ? sim.topology_update(automatic_backends, automatic.get_topology("AVAILABLE")) : EXIT_FAILURE;
-	int automatic_available_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, automatic_seq,
-		"automatic-ownership", automatic_hgs, "available", "AVAILABLE") : EXIT_FAILURE;
+	auto [automatic_probe_rc, automatic_probe] = rc == EXIT_SUCCESS ?
+		bgd_wait_for_probe(sim, automatic_seq, automatic.blue_writer.endpoint(),
+			RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin,
+			"automatic-ownership", "standalone discovery", automatic_hgs.blue_writer,
+			{ automatic_hgs.blue_writer, automatic_hgs.blue_reader,
+				automatic_hgs.green_writer, automatic_hgs.green_reader }) :
+		rc_t<RDS_BGD_Probe_Log> { EXIT_FAILURE, {} };
 	auto [automatic_runtime_rows_rc, automatic_runtime_rows] = bgd_runtime_rows(admin, automatic_hgs.blue_writer);
-	ok(rc == EXIT_SUCCESS && automatic_available_rc == EXIT_SUCCESS && automatic_runtime_rows_rc == EXIT_SUCCESS &&
+	ok(rc == EXIT_SUCCESS && automatic_probe_rc == EXIT_SUCCESS && automatic_runtime_rows_rc == EXIT_SUCCESS &&
 		automatic_runtime_rows.size() == 1 && automatic_runtime_rows[0].size() == 6 && automatic_runtime_rows[0][4] == "0",
-		"automatic-ownership: discovery retains one administrator-owned runtime BGD row instead of replacing it");
+		"automatic-ownership: standalone discovery runs and retains one administrator-owned runtime BGD row");
 	auto [automatic_bgd_after_rc, automatic_bgd_after] = mysql_query_ext_rows(admin,
 		"SELECT writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup,active,writer_is_also_reader,check_interval_ms,check_timeout_ms,comment FROM mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=1310");
 	ok(automatic_admin_snapshot_rc == EXIT_SUCCESS && automatic_runtime_snapshot_rc == EXIT_SUCCESS &&
