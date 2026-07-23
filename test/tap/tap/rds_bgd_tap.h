@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <cerrno>
 #include <string>
 #include <vector>
 
@@ -273,6 +274,25 @@ inline int bgd_wait_for_probe(
 			"probe " + backend.host + ":" + to_string(backend.port), writer_hostgroup, server_hostgroups);
 	}
 	return rc;
+}
+
+inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe_from_backends(
+	RDS_BGD_Simulator& sim, uint64_t sequence, const vector<Endpoint>& backends,
+	RDS_BGD_Probe_Kind kind, uint32_t timeout_ms, int encrypted = -1)
+{
+	const uint64_t deadline = monotonic_time() + static_cast<uint64_t>(timeout_ms) * 1000;
+	do {
+		auto [rc, logs] = sim.probe_log_since(sequence);
+		if (rc != EXIT_SUCCESS) return { EXIT_FAILURE, {} };
+		for (const RDS_BGD_Probe_Log& log : logs) {
+			for (const Endpoint& backend : backends) {
+				if (log.backend.host == backend.host && log.backend.port == backend.port && log.probe_kind == kind &&
+					(encrypted < 0 || log.encrypted == (encrypted != 0))) return { EXIT_SUCCESS, log };
+			}
+		}
+		usleep(50000);
+	} while (monotonic_time() < deadline);
+	return { ETIMEDOUT, {} };
 }
 
 inline int execute_all(MYSQL* admin, vector<string> queries) {

@@ -56,7 +56,7 @@ void set_read_only_writers(RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster) {
 }  // namespace
 
 int main() {
-	plan(16);
+	plan(18);
 
 	CommandLine cl {};
 	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
@@ -180,11 +180,27 @@ int main() {
 	ok(rc == EXIT_SUCCESS && runtime_has_server(admin, third_hgs.blue_reader, third.blue_readers[0]) &&
 		runtime_has_server(admin, third_hgs.blue_reader, third.blue_readers[1]),
 		"late-readers: runtime server state contains both newly loaded blue readers");
-	int third_probe_rc = bgd_wait_for_probe(
-		sim, third_reader_seq, third.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
-		admin, "late-readers", "replacement probe", third_hgs.blue_writer, { third_hgs.blue_writer, third_hgs.blue_reader });
-	ok(third_probe_rc == EXIT_SUCCESS,
-		"late-readers: worker replacement resumes probing the mapped green writer after reader-set change");
+	vector<Endpoint> third_blue_backends { third.blue_writer.endpoint(), third.blue_readers[0].endpoint(), third.blue_readers[1].endpoint() };
+	auto [third_restart_rc, third_restart_probe] = bgd_wait_for_probe_from_backends(
+		sim, third_reader_seq, third_blue_backends, RDS_BGD_Probe_Kind::table_check, kProbeTimeoutMs);
+	if (third_restart_rc != EXIT_SUCCESS) {
+		bgd_timeout_diagnostics(admin, sim, third_reader_seq, "late-readers", "worker replacement",
+			"a fresh blue-host table-check after the reader-set reload", third_hgs.blue_writer,
+			{ third_hgs.blue_writer, third_hgs.blue_reader });
+	}
+	ok(third_restart_rc == EXIT_SUCCESS,
+		"late-readers: reader-set reload replaces the pinned worker with a fresh blue-host topology check");
+	int third_reader_probe_rc = bgd_wait_for_probe(
+		sim, third_reader_seq, third.blue_readers[0].endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1,
+		admin, "late-readers", "reader-set probe", third_hgs.blue_writer, { third_hgs.blue_writer, third_hgs.blue_reader });
+	ok(third_reader_probe_rc == EXIT_SUCCESS,
+		"late-readers: refreshed reader set is probed with the configured reader TLS value");
+	const uint64_t third_green_baseline = third_restart_rc == EXIT_SUCCESS ? third_restart_probe.sequence_id : third_reader_seq;
+	int third_green_probe_rc = bgd_wait_for_probe(
+		sim, third_green_baseline, third.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
+		admin, "late-readers", "replacement resume", third_hgs.blue_writer, { third_hgs.blue_writer, third_hgs.blue_reader });
+	ok(third_green_probe_rc == EXIT_SUCCESS,
+		"late-readers: replacement resumes the green-writer probe after its fresh topology check");
 	auto [third_bgd_rc, third_bgd_rows] = bgd_runtime_rows(admin, third_hgs.blue_writer);
 	MYSQL* third_client = init_mysql_conn(cl.host, cl.port, cl.username, cl.password);
 	auto [third_echo_rc, third_echo] = third_client ? bgd_backend_ip_echo(third_client) : rc_t<string> { EXIT_FAILURE, {} };
