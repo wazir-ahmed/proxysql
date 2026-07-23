@@ -14,8 +14,8 @@
 
 namespace {
 
-const uint32_t kTimeoutSeconds = 10;
-const uint32_t kProbeTimeoutMs = 10000;
+const uint32_t kTimeoutSeconds = 3;
+const uint32_t kProbeTimeoutMs = 3000;
 const uint32_t kNoProbeTimeoutMs = 1200;
 
 vector<Endpoint> cluster_backends(RDS_BGD_Cluster& cluster) {

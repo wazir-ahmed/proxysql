@@ -13,8 +13,8 @@
 
 namespace {
 
-const uint32_t kTimeoutSeconds = 10;
-const uint32_t kProbeTimeoutMs = 10000;
+const uint32_t kTimeoutSeconds = 3;
+const uint32_t kProbeTimeoutMs = 3000;
 
 bool runtime_auto_row_matches(MYSQL* admin, const BGD_Hostgroups& hgs) {
 	auto [rc, rows] = bgd_runtime_rows(admin, hgs.blue_writer);
