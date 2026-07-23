@@ -262,7 +262,7 @@ inline int bgd_wait_for_condition(
 	return rc;
 }
 
-inline int bgd_wait_for_probe(
+inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe(
 	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend, RDS_BGD_Probe_Kind kind,
 	uint32_t timeout_ms, int encrypted, MYSQL* admin, const string& scenario, const string& phase,
 	int writer_hostgroup, const vector<int>& server_hostgroups)
@@ -273,7 +273,7 @@ inline int bgd_wait_for_probe(
 			admin, sim, sequence, scenario, phase,
 			"probe " + backend.host + ":" + to_string(backend.port), writer_hostgroup, server_hostgroups);
 	}
-	return rc;
+	return { rc, probe };
 }
 
 inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe_from_backends(

@@ -95,7 +95,7 @@ int main() {
 		"SELECT COUNT(*)=1 FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=810 AND status='AVAILABLE'",
 		kTimeoutSeconds, sim, first_seq, "topology-first", "BGD worker", "AVAILABLE runtime state", first_hgs.blue_writer,
 		{ first_hgs.blue_writer, first_hgs.blue_reader });
-	int first_probe_rc = bgd_wait_for_probe(
+	auto [first_probe_rc, first_probe] = bgd_wait_for_probe(
 		sim, first_seq, first.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
 		admin, "topology-first", "BGD worker probe", first_hgs.blue_writer, { first_hgs.blue_writer, first_hgs.blue_reader });
 	ok(rc == EXIT_SUCCESS && first_probe_rc == EXIT_SUCCESS,
@@ -122,7 +122,7 @@ int main() {
 		{ second.blue_writer, second.blue_readers[0], second.blue_readers[1] }, {}, 0) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to add topology-absent blue deployment");
 	}
-	int second_absent_probe_rc = bgd_wait_for_probe(
+	auto [second_absent_probe_rc, second_absent_probe] = bgd_wait_for_probe(
 		sim, second_seq, second.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
 		admin, "topology-absent", "absence probe", second_hgs.blue_writer, { second_hgs.blue_writer, second_hgs.blue_reader });
 	auto [second_absent_rows_rc, second_absent_rows] = bgd_runtime_rows(admin, second_hgs.blue_writer);
@@ -138,7 +138,7 @@ int main() {
 		"SELECT COUNT(*)=1 FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=820 AND auto_generated=1",
 		kTimeoutSeconds, sim, second_available_seq, "topology-absent", "automatic discovery", "one derived runtime row", second_hgs.blue_writer,
 		{ second_hgs.blue_writer, second_hgs.blue_reader });
-	int second_probe_rc = bgd_wait_for_probe(
+	auto [second_probe_rc, second_probe] = bgd_wait_for_probe(
 		sim, second_available_seq, second.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
 		admin, "topology-absent", "BGD worker probe", second_hgs.blue_writer, { second_hgs.blue_writer, second_hgs.blue_reader });
 	ok(rc == EXIT_SUCCESS && runtime_auto_row_matches(admin, second_hgs) && second_probe_rc == EXIT_SUCCESS,
@@ -192,13 +192,15 @@ int main() {
 		"late-readers: reader-set reload replaces the pinned worker with a fresh blue-host topology check");
 	const uint64_t third_replacement_baseline =
 		third_restart_rc == EXIT_SUCCESS ? third_restart_probe.sequence_id : third_reader_seq;
-	int third_reader_probe_rc = bgd_wait_for_probe(
+	auto [third_reader_probe_rc, third_reader_probe] = bgd_wait_for_probe(
 		sim, third_replacement_baseline, third.blue_readers[0].endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1,
 		admin, "late-readers", "reader-set probe", third_hgs.blue_writer, { third_hgs.blue_writer, third_hgs.blue_reader });
 	ok(third_reader_probe_rc == EXIT_SUCCESS,
 		"late-readers: refreshed reader set is probed with the configured reader TLS value");
-	int third_green_probe_rc = bgd_wait_for_probe(
-		sim, third_replacement_baseline, third.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
+	const uint64_t third_reader_baseline =
+		third_reader_probe_rc == EXIT_SUCCESS ? third_reader_probe.sequence_id : third_replacement_baseline;
+	auto [third_green_probe_rc, third_green_probe] = bgd_wait_for_probe(
+		sim, third_reader_baseline, third.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0,
 		admin, "late-readers", "replacement resume", third_hgs.blue_writer, { third_hgs.blue_writer, third_hgs.blue_reader });
 	ok(third_green_probe_rc == EXIT_SUCCESS,
 		"late-readers: replacement resumes the green-writer probe after its fresh topology check");
