@@ -478,7 +478,7 @@ int main() {
 	pool_rc = effects_rc == EXIT_SUCCESS ? wait_for_pool_drain(admin, sim, b_post_seq,
 		repeat_scenario, "deployment B post-processing", repeat_hgs,
 		repeat_hgs.blue_writer, deployment_b.blue_writer.hostname) : EXIT_FAILURE;
-	ok(pool_rc == EXIT_SUCCESS,
+	ok(b_pools.rc == EXIT_SUCCESS && b_pools.blue_count >= 1 && pool_rc == EXIT_SUCCESS,
 		"deployment B post-processing drains the second lifecycle blue-writer pool");
 
 	auto [b_route_rc, b_route] = pool_rc == EXIT_SUCCESS ?
@@ -662,20 +662,22 @@ int main() {
 		"cluster 1 replacement stops probing its stale deployment topology");
 
 	auto [cluster_2_reprobe_rc, cluster_2_reprobe] = bgd_wait_for_probe(sim,
-		cluster_1_replace_seq, cluster_2.green_writer.endpoint(),
+		cluster_1_b_probe.sequence_id, cluster_2.green_writer.endpoint(),
 		RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1, admin,
 		concurrent_scenario, "cluster 2 post-replacement probe",
 		cluster_2_hgs.blue_writer, all_hostgroups(cluster_2_hgs));
-	ok(cluster_2_reprobe_rc == EXIT_SUCCESS && cluster_2_reprobe.encrypted &&
+	ok(cluster_1_b_probe_rc == EXIT_SUCCESS && cluster_2_reprobe_rc == EXIT_SUCCESS &&
+		cluster_2_reprobe.encrypted &&
 		post_effects(admin, cluster_2_hgs, cluster_2),
 		"cluster 1 replacement reprobes cluster 2 and preserves its post-processing phase");
 
 	auto [cluster_3_reprobe_rc, cluster_3_reprobe] = bgd_wait_for_probe(sim,
-		cluster_1_replace_seq, cluster_3.green_writer.endpoint(),
+		cluster_1_b_probe.sequence_id, cluster_3.green_writer.endpoint(),
 		RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin,
 		concurrent_scenario, "cluster 3 post-replacement probe",
 		cluster_3_hgs.blue_writer, all_hostgroups(cluster_3_hgs));
-	ok(cluster_3_reprobe_rc == EXIT_SUCCESS && !cluster_3_reprobe.encrypted &&
+	ok(cluster_1_b_probe_rc == EXIT_SUCCESS && cluster_3_reprobe_rc == EXIT_SUCCESS &&
+		!cluster_3_reprobe.encrypted &&
 		status_is(admin, cluster_3_hgs, "WRITER_SWITCHOVER_INITIATED") &&
 		writer_placement(admin, cluster_3_hgs, cluster_3, false),
 		"cluster 1 replacement reprobes cluster 3 and preserves its initiated phase");
