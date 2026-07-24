@@ -68,6 +68,7 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// Scenario 1: topology exists before the blue writer is added.
 	RDS_BGD_Cluster first = bgd_cluster_init();
@@ -214,7 +215,8 @@ int main() {
 		third_pool_rc == EXIT_SUCCESS && third_pool >= 1,
 		"late-readers: derived hostgroups remain singular and client pool routing stays on the blue writer");
 
-	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS) diag("failed to clean final BGD TAP Admin state");
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final BGD TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

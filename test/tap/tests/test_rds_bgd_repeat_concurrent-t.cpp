@@ -294,6 +294,7 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	const string repeat_scenario = "repeat-deployment";
 	RDS_BGD_Cluster deployment_a = bgd_cluster_init();
@@ -682,11 +683,8 @@ int main() {
 		writer_placement(admin, cluster_3_hgs, cluster_3, false),
 		"cluster 1 replacement reprobes cluster 3 and preserves its initiated phase");
 
-	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS ||
-		sim.topology_drop(concurrent_backends) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to clean repeated/concurrent scenarios");
-	}
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final repeated/concurrent TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

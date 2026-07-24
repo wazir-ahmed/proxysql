@@ -141,6 +141,7 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// Automatic mode takes direct-probe TLS from the matched blue writer.
 	RDS_BGD_Cluster automatic = bgd_cluster_init();
@@ -265,9 +266,8 @@ int main() {
 	ok(blue_backend_and_pool_match(cl, admin, defaults_cluster, defaults_hgs),
 		"defaults-created: client backend and connection pool remain on the configured blue writer");
 
-	if (scenario_cleanup(admin, sim, cluster_backends(defaults_cluster)) != EXIT_SUCCESS) {
-		diag("failed to clean final BGD TAP Admin state");
-	}
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final probe/TLS TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

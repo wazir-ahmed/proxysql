@@ -163,6 +163,24 @@ public:
 	int topology_error(vector<Endpoint> backends, int error_code, string error_msg);
 
 	/**
+	 * @brief Removes all read-only, topology-control, topology-row, and probe state.
+	 *
+	 * @return EXIT_SUCCESS when the simulator state is empty; EXIT_FAILURE otherwise.
+	 */
+	int cleanup();
+
+	/**
+	 * @brief Waits until no new probe telemetry is recorded for a quiet interval.
+	 *
+	 * @param timeout_ms Maximum total wait.
+	 * @param quiet_ms Required interval without a new probe.
+	 *
+	 * @return EXIT_SUCCESS after the quiet interval, ETIMEDOUT on timeout, or
+	 *   EXIT_FAILURE when telemetry cannot be read.
+	 */
+	int wait_for_probe_quiescence(uint32_t timeout_ms, uint32_t quiet_ms);
+
+	/**
 	 * @brief Reads the latest sequence from the RDS BGD probe log.
 	 *
 	 * @return EXIT_SUCCESS and the latest sequence, or zero when the log is empty;

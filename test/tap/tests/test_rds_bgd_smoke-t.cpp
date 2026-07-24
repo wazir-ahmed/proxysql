@@ -35,6 +35,7 @@ int configure_proxysql_for_bgd(MYSQL* admin, RDS_BGD_Cluster& cluster) {
 		"SET mysql-monitor_username='testuser'",
 		"SET mysql-monitor_password='testuser'",
 		"SET mysql-monitor_enabled='true'",
+		"SET mysql-aws_blue_green_deployment_auto_discovery='false'",
 		"LOAD MYSQL VARIABLES TO RUNTIME",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 	});
@@ -58,12 +59,12 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// Initialize the test cluster and make both simulated writers writable.
 	RDS_BGD_Cluster cluster = bgd_cluster_init();
 	for (Endpoint& writer : cluster.get_writer_hosts()) {
 		if (sim.read_only_update(writer, false) != EXIT_SUCCESS) {
-			mysql_close(admin);
 			BAIL_OUT("failed to configure writer read_only state");
 		}
 	}
@@ -71,7 +72,6 @@ int main() {
 	// Record the last probe sequence before enabling BGD monitoring.
 	auto [rc, last_seq] = sim.probe_log_last_sequence();
 	if (rc != EXIT_SUCCESS) {
-		mysql_close(admin);
 		BAIL_OUT("failed to read the last BGD probe-log sequence");
 	}
 
@@ -79,13 +79,11 @@ int main() {
 	rc = sim.topology_update(cluster.get_writers(), cluster.get_topology("AVAILABLE"));
 	ok(rc == EXIT_SUCCESS, "publish AVAILABLE topology to both writer IPs");
 	if (rc != EXIT_SUCCESS) {
-		mysql_close(admin);
 		BAIL_OUT("failed to publish BGD topology");
 	}
 
 	// Configure ProxySQL with the blue writer and BGD hostgroups.
 	if (configure_proxysql_for_bgd(admin, cluster) != EXIT_SUCCESS) {
-		mysql_close(admin);
 		BAIL_OUT("failed to configure ProxySQL for BGD monitoring");
 	}
 
@@ -103,6 +101,8 @@ int main() {
 		RDS_BGD_Probe_Kind::metadata, 3000, 0);
 	ok(probe_rc == EXIT_SUCCESS, "ProxySQL probes topology directly on the green writer IP over plaintext");
 
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final smoke TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

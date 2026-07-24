@@ -166,9 +166,15 @@ int enter_reader_switchover(MYSQL* admin, RDS_BGD_Simulator& sim, RDS_BGD_Cluste
 	int rc = post_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_reader_pair(cluster, "SWITCHOVER_IN_POST_PROCESSING")) : EXIT_FAILURE;
 	if (rc != EXIT_SUCCESS || wait_for_status(admin, sim, post_seq, scenario, hgs, "post-processing", "WRITER_SWITCHOVER_POST_PROCESSING") != EXIT_SUCCESS ||
 		bgd_wait_for_condition(admin,
-			"SELECT COUNT(*)=1 FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
-			" AND hostname=" + bgd_sql_quote(cluster.blue_readers[1].hostname) + " AND port=3306 AND status='SHUNNED_AWS_BGD'",
-			kTimeoutSeconds, sim, post_seq, scenario, "post-processing shun", "unmatched reader is BGD shunned",
+			"SELECT "
+			"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
+			" AND hostname=" + bgd_sql_quote(cluster.blue_writer.hostname) + " AND port=3306 AND status='ONLINE')=1 AND "
+			"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+			" AND hostname=" + bgd_sql_quote(cluster.blue_writer.hostname) + " AND port=3306)=0 AND "
+			"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
+			" AND hostname=" + bgd_sql_quote(cluster.blue_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1",
+			kTimeoutSeconds, sim, post_seq, scenario, "post-processing placement",
+			"writer restored and mapped reader remains ONLINE",
 			hgs.blue_writer, { hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader }) != EXIT_SUCCESS) return EXIT_FAILURE;
 	auto [completed_seq_rc, completed_seq] = sim.probe_log_last_sequence();
 	rc = completed_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, target_only_completed(cluster)) : EXIT_FAILURE;
@@ -200,6 +206,7 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// Present-but-empty pre-completion topology is rollback, not green cleanup.
 	RDS_BGD_Cluster empty_pre = bgd_cluster_init();
@@ -285,7 +292,7 @@ int main() {
 		empty_reader_drain_rc == EXIT_SUCCESS && empty_reader_after_writer_rc == EXIT_SUCCESS && empty_reader_after_writer == 0 &&
 		empty_reader_after_reader_rc == EXIT_SUCCESS && empty_reader_after_reader == 0 &&
 		server_has_status(admin, empty_reader_hgs.blue_reader, empty_reader.blue_readers[1], "ONLINE") && green_rows_remain(admin, empty_reader_hgs, empty_reader),
-		"reader-switchover successful empty metadata unshuns readers, drains both green pools, and retains green rows");
+		"reader-switchover successful empty metadata restores readers, drains both green pools, and retains green rows");
 	ok(telemetry_has_kind(sim, empty_reader_seq, empty_reader.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata),
 		"reader-switchover empty topology is observed through successful direct metadata");
 
@@ -427,9 +434,8 @@ int main() {
 		!telemetry_has_kind(sim, generic_seq, generic_error.green_writer.endpoint(), RDS_BGD_Probe_Kind::table_check),
 		"generic metadata failure remains a metadata telemetry path rather than an absent-table path");
 
-	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(generic_error_backends) != EXIT_SUCCESS) {
-		diag("failed to clean topology-failure scenario state");
-	}
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final topology-failure TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

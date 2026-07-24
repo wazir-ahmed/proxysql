@@ -145,7 +145,7 @@ int wait_for_precompletion_rollback(MYSQL* admin, RDS_BGD_Simulator& sim, uint64
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
 		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[1].hostname) + " AND port=3306 AND status='ONLINE')=1";
 	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, scenario, "present-empty",
-		"rollback restores blue placement and unshuns readers", hgs.blue_writer,
+		"rollback restores blue placement and reader availability", hgs.blue_writer,
 		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
 }
 
@@ -227,6 +227,7 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// A fresh worker first sees SWITCHOVER_INITIATED.
 	RDS_BGD_Cluster initiated = bgd_cluster_init();
@@ -361,9 +362,9 @@ int main() {
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(post_hgs.blue_reader) +
 		" AND hostname=" + bgd_sql_quote(post.blue_writer.hostname) + " AND port=3306)=0 AND "
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(post_hgs.blue_reader) +
-		" AND hostname=" + bgd_sql_quote(post.blue_readers[1].hostname) + " AND port=3306 AND status='SHUNNED_AWS_BGD')=1",
+		" AND hostname=" + bgd_sql_quote(post.blue_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1",
 		kTimeoutSeconds, sim, post_publish_seq, "fresh-post-processing", "first observation",
-		"writer placement and unmatched-reader BGD shun", post_hgs.blue_writer,
+		"writer placement and mapped-reader availability", post_hgs.blue_writer,
 		{ post_hgs.blue_writer, post_hgs.blue_reader, post_hgs.green_writer, post_hgs.green_reader }) : EXIT_FAILURE;
 	int post_pool_drain_rc = post_effects_rc == EXIT_SUCCESS ? bgd_wait_for_condition(admin,
 		"SELECT COALESCE(SUM(ConnUsed+ConnFree),0)=0 FROM stats_mysql_connection_pool WHERE srv_host=" +
@@ -373,7 +374,7 @@ int main() {
 	auto [post_echo_rc, post_echo] = post_pool_drain_rc == EXIT_SUCCESS ? connect_and_echo(cl) : rc_t<string> { EXIT_FAILURE, {} };
 	ok(post_effects_rc == EXIT_SUCCESS && post_pool_drain_rc == EXIT_SUCCESS && post_echo_rc == EXIT_SUCCESS &&
 		post_echo.find(post.green_writer.ip) != string::npos,
-		"fresh post-processing builds map and resolution before pinning, draining, placement, and reader shunning");
+		"fresh post-processing builds map and resolution before pinning, draining, and placement");
 
 	int64_t post_reader_log = last_read_only_log_time(admin, post.blue_readers[0]);
 	set_read_only(sim, post, true, false);
@@ -393,8 +394,8 @@ int main() {
 	ok(rc == EXIT_SUCCESS && post_repeat_rc == EXIT_SUCCESS &&
 		wait_for_status(admin, sim, post_repeat_seq, "fresh-post-processing", post_hgs, "repeat", "WRITER_SWITCHOVER_POST_PROCESSING") == EXIT_SUCCESS &&
 		writer_placement(admin, post_hgs, post, true, false) &&
-		server_has_status(admin, post_hgs.blue_reader, post.blue_readers[1], "SHUNNED_AWS_BGD"),
-		"repeated fresh post-processing observation preserves writer placement and reader shun");
+		server_has_status(admin, post_hgs.blue_reader, post.blue_readers[0], "ONLINE"),
+		"repeated fresh post-processing observation preserves writer and mapped-reader placement");
 
 	auto [post_empty_seq_rc, post_empty_seq] = sim.probe_log_last_sequence();
 	rc = post_empty_seq_rc == EXIT_SUCCESS ? sim.topology_delete(post_backends) : EXIT_FAILURE;
@@ -405,7 +406,7 @@ int main() {
 	ok(rc == EXIT_SUCCESS && post_none_rc == EXIT_SUCCESS &&
 		wait_for_precompletion_rollback(admin, sim, post_empty_seq, "fresh-post-processing", post_hgs, post) == EXIT_SUCCESS &&
 		post_blue_probe_rc == EXIT_SUCCESS,
-		"fresh post-processing present-empty rollback unshuns readers and removes the temporary blue pin");
+		"fresh post-processing present-empty rollback restores readers and removes the temporary blue pin");
 
 	// A fresh worker first sees the target-only completed observation.  It has no prior map
 	// or effects to reconstruct, but reader-phase cleanup still drains configured green pools.
@@ -438,7 +439,7 @@ int main() {
 	ok(completed_no_green_rc == ETIMEDOUT && completed_echo_rc == EXIT_SUCCESS &&
 		completed_echo.find(completed.blue_writer.ip) != string::npos && writer_placement(admin, completed_hgs, completed, true, false) &&
 		server_has_status(admin, completed_hgs.blue_reader, completed.blue_readers[1], "ONLINE"),
-		"fresh completed does not reconstruct earlier direct-green map, blue pin, demotion, or reader-shun effects");
+		"fresh completed does not reconstruct earlier direct-green map, blue pin, or demotion effects");
 
 	auto [completed_repeat_seq_rc, completed_repeat_seq] = sim.probe_log_last_sequence();
 	rc = completed_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(completed_backends,
@@ -475,9 +476,8 @@ int main() {
 		server_has_status(admin, completed_hgs.blue_reader, completed.blue_readers[1], "ONLINE"),
 		"fresh completed present-empty cleanup reaches NONE safely and drains configured green pools");
 
-	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(completed_backends) != EXIT_SUCCESS) {
-		diag("failed to clean late-entry scenario state");
-	}
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final late-entry TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

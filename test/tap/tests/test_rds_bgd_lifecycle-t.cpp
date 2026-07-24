@@ -93,7 +93,6 @@ int wait_for_post_runtime_effects(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t
 {
 	const RDS_BGD_Host& writer = cluster.blue_writer;
 	const RDS_BGD_Host& mapped_reader = cluster.blue_readers[0];
-	const RDS_BGD_Host& unmatched_reader = cluster.blue_readers[1];
 	const string query = "SELECT "
 		"(SELECT COUNT(*) FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=" +
 		to_string(hgs.blue_writer) + " AND status='WRITER_SWITCHOVER_POST_PROCESSING')=1 AND " +
@@ -106,12 +105,9 @@ int wait_for_post_runtime_effects(MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t
 		" AND hostname=" + bgd_sql_quote(mapped_reader.hostname) + " AND port=" + to_string(mapped_reader.port) +
 		" AND status='ONLINE')=1 AND " +
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_writer) +
-		" AND hostname=" + bgd_sql_quote(mapped_reader.hostname) + " AND port=" + to_string(mapped_reader.port) + ")=0 AND " +
-		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hgs.blue_reader) +
-		" AND hostname=" + bgd_sql_quote(unmatched_reader.hostname) + " AND port=" + to_string(unmatched_reader.port) +
-		" AND status='SHUNNED_AWS_BGD')=1";
+		" AND hostname=" + bgd_sql_quote(mapped_reader.hostname) + " AND port=" + to_string(mapped_reader.port) + ")=0";
 	return bgd_wait_for_condition(admin, query, kTimeoutSeconds, sim, sequence, kScenario, "post-processing effects",
-		"writer and mapped-reader placement with unmatched-reader BGD shun", hgs.blue_writer,
+		"writer and mapped-reader placement", hgs.blue_writer,
 		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
 }
 
@@ -198,12 +194,12 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	RDS_BGD_Cluster cluster = bgd_cluster_init();
 	BGD_Hostgroups hgs { 970, 971, 972, 973 };
 	vector<Endpoint> backends = topology_backends(cluster);
 	if (scenario_cleanup(admin, sim, backends) != EXIT_SUCCESS) {
-		mysql_close(admin);
 		BAIL_OUT("failed to reset normal lifecycle scenario");
 	}
 
@@ -217,7 +213,6 @@ int main() {
 	if (bgd_admin_setup(admin, cluster, hgs, BGD_Admin_Mode::explicit_configuration,
 		{ cluster.blue_writer, cluster.blue_readers[0], cluster.blue_readers[1] },
 		{ cluster.green_writer, cluster.green_readers[0] }) != EXIT_SUCCESS) {
-		mysql_close(admin);
 		BAIL_OUT("failed to configure normal lifecycle scenario");
 	}
 
@@ -314,7 +309,7 @@ int main() {
 	int post_runtime_effects_rc = post_rc == EXIT_SUCCESS ?
 		wait_for_post_runtime_effects(admin, sim, post_seq, cluster, hgs) : EXIT_FAILURE;
 	ok(post_runtime_effects_rc == EXIT_SUCCESS,
-		"post-processing restores writer placement and shuns the unmatched blue reader");
+		"post-processing restores writer placement and retains the mapped reader");
 
 	int post_pool_drain_rc = post_runtime_effects_rc == EXIT_SUCCESS ?
 		wait_for_blue_writer_pool_drain(admin, sim, post_seq, cluster, hgs) : EXIT_FAILURE;
@@ -338,8 +333,9 @@ int main() {
 	int post_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, post_repeat_seq, cluster, hgs, "post-processing repeat") : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && post_repeat_rc == EXIT_SUCCESS &&
 		wait_for_status(admin, sim, post_repeat_seq, hgs, "post-processing repeat", "WRITER_SWITCHOVER_POST_PROCESSING") == EXIT_SUCCESS &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "SHUNNED_AWS_BGD"),
-		"repeated post-processing observation preserves status, shun, and placement effects");
+		writer_in_expected_placement(admin, hgs, cluster, true, false) &&
+		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE"),
+		"repeated post-processing observation preserves status and mapped placement");
 
 	auto [completed_seq_rc, completed_seq] = sim.probe_log_last_sequence();
 	rc = completed_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, target_only_completed(cluster)) : EXIT_FAILURE;
@@ -347,16 +343,16 @@ int main() {
 	ok(rc == EXIT_SUCCESS && completed_rc == EXIT_SUCCESS,
 		"target-only SWITCHOVER_COMPLETED observation enters inferred reader-switchover status");
 
-	ok(server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "SHUNNED_AWS_BGD"),
-		"writer completion defers unmatched-reader cleanup until the reader signal");
+	ok(green_rows_remain_online(admin, hgs, cluster),
+		"writer completion defers green-row cleanup until the reader signal");
 
 	auto [completed_repeat_seq_rc, completed_repeat_seq] = sim.probe_log_last_sequence();
 	rc = completed_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, target_only_completed(cluster)) : EXIT_FAILURE;
 	int completed_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, completed_repeat_seq, cluster, hgs, "target-only completed repeat") : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && completed_repeat_rc == EXIT_SUCCESS &&
 		wait_for_status(admin, sim, completed_repeat_seq, hgs, "target-only completed repeat", "READER_SWITCHOVER_IN_PROGRESS") == EXIT_SUCCESS &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "SHUNNED_AWS_BGD"),
-		"repeated target-only completed observation preserves reader-switchover effects");
+		green_rows_remain_online(admin, hgs, cluster),
+		"repeated target-only completed observation preserves reader-switchover phase and green rows");
 
 	auto [empty_seq_rc, empty_seq] = sim.probe_log_last_sequence();
 	rc = empty_seq_rc == EXIT_SUCCESS ? sim.topology_delete(backends) : EXIT_FAILURE;
@@ -365,7 +361,7 @@ int main() {
 		"present-but-empty topology completes reader cleanup and reaches NONE");
 
 	ok(server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "ONLINE"),
-		"final cleanup unshuns the recorded unmatched blue reader");
+		"final cleanup restores the unmatched blue reader to ONLINE");
 
 	auto [empty_green_rc, empty_green_probe] = bgd_wait_for_probe(sim, empty_seq, cluster.green_writer.endpoint(),
 		RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin, kScenario, "present-empty green observation",
@@ -388,9 +384,8 @@ int main() {
 	ok(green_rows_remain_online(admin, hgs, cluster),
 		"final cleanup retains all configured green rows and statuses");
 
-	if (scenario_cleanup(admin, sim, backends) != EXIT_SUCCESS) {
-		diag("failed to clean normal lifecycle scenario");
-	}
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final lifecycle TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

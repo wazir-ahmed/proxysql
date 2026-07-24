@@ -178,6 +178,7 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// Explicit configuration loaded before any eligible blue server.
 	RDS_BGD_Cluster first = bgd_cluster_init();
@@ -408,7 +409,8 @@ int main() {
 		persistent_row_absent(admin, automatic_save_hgs.blue_writer),
 		"save-from-runtime: SAVE recreates the missing explicit BGD row and skips the automatic runtime row");
 
-	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS) diag("failed to clean final BGD TAP Admin state");
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final BGD TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

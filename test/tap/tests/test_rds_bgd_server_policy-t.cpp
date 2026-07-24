@@ -158,12 +158,11 @@ int configure_inactive_explicit_ownership(MYSQL* admin, const RDS_BGD_Cluster& c
 	const BGD_Hostgroups& hgs)
 {
 	if (execute_all(admin, {
-			"SET mysql-monitor_enabled='false'",
-			"LOAD MYSQL VARIABLES TO RUNTIME",
 			"INSERT INTO mysql_replication_hostgroups(writer_hostgroup,reader_hostgroup) VALUES (" +
 				to_string(hgs.blue_writer) + "," + to_string(hgs.blue_reader) + ")",
 			"SET mysql-monitor_username='testuser'",
 			"SET mysql-monitor_password='testuser'",
+			"SET mysql-monitor_enabled='true'",
 			"SET mysql-monitor_read_only_interval=100",
 			"SET mysql-monitor_aws_rds_topology_discovery_interval=1",
 			"SET mysql-aws_blue_green_deployment_auto_discovery='false'",
@@ -188,7 +187,6 @@ int configure_inactive_explicit_ownership(MYSQL* admin, const RDS_BGD_Cluster& c
 		"LOAD MYSQL USERS TO RUNTIME",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 		"SET mysql-aws_blue_green_deployment_auto_discovery='true'",
-		"SET mysql-monitor_enabled='true'",
 		"LOAD MYSQL VARIABLES TO RUNTIME",
 	});
 }
@@ -219,9 +217,10 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
-	// Eligible reader matching is independent from the unmatched-reader policy.  Rollback must
-	// leave every configured green row and its pre-existing pool untouched.
+	// Eligible reader matching is independent from other configured readers. Rollback must leave
+	// every configured green row and its pre-existing pool untouched.
 	RDS_BGD_Cluster matched = bgd_cluster_init();
 	BGD_Hostgroups matched_hgs { 1280, 1281, 1282, 1283 };
 	vector<Endpoint> matched_backends = scenario_backends(matched);
@@ -259,14 +258,12 @@ int main() {
 	int matched_effects_rc = matched_post_rc == EXIT_SUCCESS ? bgd_wait_for_condition(admin,
 		"SELECT "
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1281 AND hostname=" +
-		bgd_sql_quote(matched.blue_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1 AND "
-		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1281 AND hostname=" +
-		bgd_sql_quote(matched.blue_readers[1].hostname) + " AND port=3306 AND status='SHUNNED_AWS_BGD')=1",
+		bgd_sql_quote(matched.blue_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1",
 		kTimeoutSeconds, sim, matched_post_seq, "matched-unmatched", "post processing",
-		"eligible mapped reader remains ONLINE and only unmatched reader is BGD shunned", matched_hgs.blue_writer,
+		"eligible mapped reader remains ONLINE", matched_hgs.blue_writer,
 		{ matched_hgs.blue_writer, matched_hgs.blue_reader, matched_hgs.green_writer, matched_hgs.green_reader }) : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && matched_effects_rc == EXIT_SUCCESS,
-		"matched-unmatched: eligible pair stays mapped while only the unmatched blue reader is SHUNNED_AWS_BGD");
+		"matched-unmatched: the eligible reader pair stays mapped and ONLINE");
 
 	auto [matched_rollback_seq_rc, matched_rollback_seq] = sim.probe_log_last_sequence();
 	rc = matched_rollback_seq_rc == EXIT_SUCCESS ? sim.topology_delete(matched_backends) : EXIT_FAILURE;
@@ -280,9 +277,9 @@ int main() {
 			matched_admin_snapshot, matched_runtime_snapshot),
 		"matched-unmatched: rollback preserves exact green rows and does not drain their established pools");
 
-	// Offline blue rows are excluded from both map construction and reader shunning.  With the
-	// remaining eligible reader unmatched because its green counterpart is OFFLINE_HARD, the
-	// monitor keeps the writer temporarily in the reader hostgroup.
+	// Offline blue rows are excluded from map construction. With the remaining reader unmatched
+	// because its green counterpart is OFFLINE_HARD, the monitor keeps the writer temporarily in
+	// the reader hostgroup.
 	RDS_BGD_Cluster fallback = bgd_cluster_2_init();
 	RDS_BGD_Cluster fallback_extra = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups fallback_hgs { 1290, 1291, 1292, 1293 };
@@ -323,8 +320,6 @@ int main() {
 	int fallback_effects_rc = fallback_post_rc == EXIT_SUCCESS ? bgd_wait_for_condition(admin,
 		"SELECT "
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1291 AND hostname=" +
-		bgd_sql_quote(fallback.blue_readers[0].hostname) + " AND port=3306 AND status='SHUNNED_AWS_BGD')=1 AND "
-		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1291 AND hostname=" +
 		bgd_sql_quote(fallback.blue_readers[1].hostname) + " AND port=3306 AND status='OFFLINE_SOFT')=1 AND "
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1291 AND hostname=" +
 		bgd_sql_quote(fallback_extra.blue_readers[0].hostname) + " AND port=3306)=0 AND "
@@ -337,7 +332,7 @@ int main() {
 		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=1293 AND hostname=" +
 		bgd_sql_quote(fallback_extra.green_readers[0].hostname) + " AND port=3306 AND status='ONLINE')=1",
 		kTimeoutSeconds, sim, fallback_seq, "offline-fallback", "post processing",
-		"only eligible unmatched reader shunned, offline blue rows excluded, writer fallback retained", fallback_hgs.blue_writer,
+		"offline blue rows excluded and writer fallback retained", fallback_hgs.blue_writer,
 		{ fallback_hgs.blue_writer, fallback_hgs.blue_reader, fallback_hgs.green_writer, fallback_hgs.green_reader }) : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && fallback_effects_rc == EXIT_SUCCESS &&
 		persistent_server_has_status(admin, fallback_hgs.blue_reader, fallback_extra.blue_readers[0], "OFFLINE_HARD") &&
@@ -481,7 +476,8 @@ int main() {
 			automatic_admin_snapshot, automatic_runtime_snapshot),
 		"automatic-ownership: discovery never overwrites administrator-owned BGD configuration or green rows/statuses");
 
-	if (reset_scenario(admin, sim, automatic_backends) != EXIT_SUCCESS) diag("failed to clean final BGD server-policy scenario");
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final server-policy TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

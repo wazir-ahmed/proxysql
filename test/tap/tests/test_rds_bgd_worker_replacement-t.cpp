@@ -193,6 +193,7 @@ int main() {
 		mysql_close(admin);
 		BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// Changing active BGD input during a pre-completion phase stops the old worker.  Its
 	// observable cleanup must restore blue placement before a new definition is enabled.
@@ -473,7 +474,8 @@ int main() {
 	ok(completed_replacement_status_rc == EXIT_SUCCESS,
 		"completed-phase replacement republishes the accepted reader-switchover behavior");
 
-	if (reset_scenario(admin, sim, completed_backends) != EXIT_SUCCESS) diag("failed to clean worker replacement scenario");
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final worker-replacement TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

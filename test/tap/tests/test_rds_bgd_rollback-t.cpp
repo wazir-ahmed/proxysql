@@ -143,6 +143,7 @@ int main() {
 	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
 		mysql_close(admin); BAIL_OUT("failed to connect to the SQLite3-server simulator");
 	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
 	// Accepted initiated cancellation: monitor creates this target server in an initially empty configured green HG.
 	RDS_BGD_Cluster created = bgd_cluster_init();
@@ -280,7 +281,8 @@ int main() {
 			explicit_admin_writer, explicit_runtime_writer, explicit_admin_reader, explicit_runtime_reader),
 		"repeated returned AVAILABLE preserves placement, probe routing, green rows, and green pools");
 
-	if (reset_scenario(admin, sim, explicit_backends) != EXIT_SUCCESS) diag("failed to clean rollback scenario");
+	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
+	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final rollback TAP state");
 	mysql_close(admin);
 	return exit_status();
 }

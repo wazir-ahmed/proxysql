@@ -97,14 +97,67 @@ inline string bgd_sql_quote(const string& value) {
 }
 
 inline int bgd_admin_cleanup(MYSQL* admin) {
-	return execute_all(admin, {
+	int config_rc = execute_all(admin, {
+		"SET mysql-aws_blue_green_deployment_auto_discovery='false'",
+		"LOAD MYSQL VARIABLES TO RUNTIME",
+		"DELETE FROM mysql_aws_rds_bgd_hostgroups",
+		"LOAD MYSQL SERVERS TO RUNTIME",
+	});
+	int state_rc = execute_all(admin, {
 		"DELETE FROM mysql_servers",
 		"DELETE FROM mysql_replication_hostgroups",
-		"DELETE FROM mysql_aws_rds_bgd_hostgroups",
 		"UPDATE mysql_users SET default_hostgroup=0 WHERE username='testuser'",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 		"LOAD MYSQL USERS TO RUNTIME",
 	});
+	return config_rc == EXIT_SUCCESS && state_rc == EXIT_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+inline int bgd_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	int admin_rc = bgd_admin_cleanup(admin);
+	int quiescence_rc = sim.wait_for_probe_quiescence(3000, 1200);
+	int simulator_rc = sim.cleanup();
+	return admin_rc == EXIT_SUCCESS && quiescence_rc == EXIT_SUCCESS &&
+		simulator_rc == EXIT_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+namespace bgd_cleanup_detail {
+
+static MYSQL* exit_admin = nullptr;
+static RDS_BGD_Simulator* exit_simulator = nullptr;
+static bool exit_handler_registered = false;
+
+inline void cleanup_at_exit() {
+	if (exit_admin == nullptr || exit_simulator == nullptr) return;
+
+	MYSQL* admin = exit_admin;
+	RDS_BGD_Simulator* simulator = exit_simulator;
+	exit_admin = nullptr;
+	exit_simulator = nullptr;
+	bgd_test_cleanup(admin, *simulator);
+}
+
+}  // namespace bgd_cleanup_detail
+
+inline int bgd_register_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	using namespace bgd_cleanup_detail;
+	if (exit_admin != nullptr || exit_simulator != nullptr) return EALREADY;
+	if (!exit_handler_registered) {
+		if (atexit(cleanup_at_exit) != 0) return EXIT_FAILURE;
+		exit_handler_registered = true;
+	}
+	exit_admin = admin;
+	exit_simulator = &sim;
+	return EXIT_SUCCESS;
+}
+
+inline int bgd_finish_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	int cleanup_rc = bgd_test_cleanup(admin, sim);
+	if (cleanup_rc == EXIT_SUCCESS) {
+		bgd_cleanup_detail::exit_admin = nullptr;
+		bgd_cleanup_detail::exit_simulator = nullptr;
+	}
+	return cleanup_rc;
 }
 
 inline int bgd_admin_add_servers(

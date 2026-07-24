@@ -1,6 +1,7 @@
 #include "rds_bgd_simulator.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 #include <unistd.h>
@@ -118,6 +119,50 @@ int RDS_BGD_Simulator::topology_error(vector<Endpoint> backends, int error_code,
 			sql_quote(error_msg) + ")");
 	}
 	return execute_transaction(statements);
+}
+
+int RDS_BGD_Simulator::cleanup() {
+	vector<string> statements {
+		"DELETE FROM READONLY_STATUS",
+		"DELETE FROM RDS_BGD_TOPOLOGY",
+		"DELETE FROM RDS_BGD_CONTROL",
+		"DELETE FROM RDS_BGD_PROBE_LOG",
+	};
+	return execute_transaction(statements);
+}
+
+int RDS_BGD_Simulator::wait_for_probe_quiescence(uint32_t timeout_ms, uint32_t quiet_ms) {
+	auto [sequence_rc, last_sequence] = probe_log_last_sequence();
+	if (sequence_rc != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+
+	using steady_clock = std::chrono::steady_clock;
+	auto started = steady_clock::now();
+	auto quiet_since = started;
+	while (true) {
+		auto now = steady_clock::now();
+		auto quiet_elapsed =
+			std::chrono::duration_cast<std::chrono::milliseconds>(now - quiet_since).count();
+		if (quiet_elapsed >= quiet_ms) {
+			return EXIT_SUCCESS;
+		}
+		auto total_elapsed =
+			std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count();
+		if (total_elapsed >= timeout_ms) {
+			return ETIMEDOUT;
+		}
+
+		usleep(10000);
+		auto [current_rc, current_sequence] = probe_log_last_sequence();
+		if (current_rc != EXIT_SUCCESS) {
+			return EXIT_FAILURE;
+		}
+		if (current_sequence != last_sequence) {
+			last_sequence = current_sequence;
+			quiet_since = steady_clock::now();
+		}
+	}
 }
 
 rc_t<uint64_t> RDS_BGD_Simulator::probe_log_last_sequence() {

@@ -419,6 +419,19 @@ MYSQL * MySQL_Monitor_Connection_Pool::get_connection(char *hostname, int port, 
 
 					if (!mysql) continue;
 
+					// The pool is grouped by hostname and port, but the same server can
+					// be reconfigured between plaintext and TLS. Never reuse a connection
+					// whose transport no longer matches the requesting monitor task.
+					bool connection_uses_ssl = mysql->options.use_ssl != 0;
+					if (mmsd && connection_uses_ssl != mmsd->use_ssl) {
+						MySQL_Monitor_State_Data* close_mmsd =
+							new MySQL_Monitor_State_Data(MON_CLOSE_CONNECTION, (char*)"", 0, false);
+						close_mmsd->mysql = mysql;
+						GloMyMon->queue->add(
+							new WorkItem<MySQL_Monitor_State_Data>(close_mmsd, NULL));
+						continue;
+					}
+
 					// close connection if not used for a while
 					unsigned long long then = *(unsigned long long*)mysql->net.buff;
 					if (now > (then + mysql_thread___monitor_ping_interval * 1000 * 10)) {
@@ -7859,6 +7872,9 @@ void MySQL_Monitor::handle_aws_rds_bgd_post_switchover(AWS_RDS_BGD_State& st, bo
 	for (const AWS_RDS_BlueGreenPair& p : st.bg_map) {
 		dns_cache->remove(p.blue_host);
 		My_Conn_Pool->purge_connections(p.blue_host.c_str(), p.port);
+		if (!p.green_ip.empty()) {
+			My_Conn_Pool->purge_connections(p.green_ip.c_str(), p.port);
+		}
 	}
 
 	if (!rollback) {
