@@ -114,6 +114,16 @@ inline int bgd_set_writer_read_only_0(RDS_BGD_Simulator& sim, RDS_BGD_Cluster& c
 	return EXIT_SUCCESS;
 }
 
+inline int bgd_set_host_read_only_0(RDS_BGD_Simulator& sim, RDS_BGD_Host& host) {
+	int rc = sim.read_only_update(host.host_endpoint(), false);
+	return rc;
+}
+
+inline int bgd_set_host_read_only_1(RDS_BGD_Simulator& sim, RDS_BGD_Host& host) {
+	int rc = sim.read_only_update(host.host_endpoint(), true);
+	return rc;
+}
+
 inline string bgd_sql_quote(string value) {
 	string quoted { "'" };
 	for (char c : value) {
@@ -547,6 +557,39 @@ inline int bgd_expect_no_metadata_probe_from_backends(
 		return EXIT_SUCCESS;
 	}
 	return EXIT_FAILURE;
+}
+
+/**
+ * Verify that read_only monitoring remains suppressed for the full observation window.
+ *
+ * The helper fails immediately if a new read_only log row appears after the
+ * supplied baseline.
+ */
+inline int bgd_expect_no_read_only_log(MYSQL* admin, RDS_BGD_Host& host, int64_t baseline, uint32_t timeout_ms) {
+	if (baseline < 0) {
+		return EXIT_FAILURE;
+	}
+
+	uint64_t deadline = monotonic_time() + static_cast<uint64_t>(timeout_ms) * 1000;
+	do {
+		string query =
+			"SELECT COUNT(*) FROM mysql_server_read_only_log WHERE hostname=" +
+			bgd_sql_quote(host.hostname) + " AND port=" + to_string(host.port) +
+			" AND time_start_us>" + to_string(baseline);
+
+		auto [rc, rows] = mysql_query_ext_rows(admin, query);
+		if (rc != EXIT_SUCCESS || rows.size() != 1 || rows[0].size() != 1) {
+			return EXIT_FAILURE;
+		}
+
+		if (rows[0][0] != "0") {
+			return EXIT_FAILURE;
+		}
+
+		usleep(50000);
+	} while (monotonic_time() < deadline);
+
+	return EXIT_SUCCESS;
 }
 
 inline int execute_all(MYSQL* admin, vector<string> queries) {
