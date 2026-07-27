@@ -7465,11 +7465,12 @@ void MySQL_Monitor::aws_rds_bgd_config_refresh_action(AWS_RDS_BGD_State& st, AWS
 	bool has_new_writer = aws_rds_bgd_find_writer(st.bg_map, new_writer);
 	aws_rds_bgd_add_green_writer_in_hg(st);
 
-	// Transfer the writer demotion when the refreshed configuration maps a different writer.
-	if (st.bgd_status == AWS_RDS_BGD_Status::WRITER_SWITCHOVER_IN_PROGRESS
-		&& (had_old_writer != has_new_writer
-			|| (had_old_writer && (old_writer.host != new_writer.host || old_writer.port != new_writer.port)))) {
-		if (had_old_writer) {
+	// Reapply the in-progress demotion after the configuration reload restores configured placement.
+	if (st.bgd_status == AWS_RDS_BGD_Status::WRITER_SWITCHOVER_IN_PROGRESS) {
+		bool writer_changed =
+			had_old_writer != has_new_writer ||
+			(had_old_writer && (old_writer.host != new_writer.host || old_writer.port != new_writer.port));
+		if (writer_changed && had_old_writer) {
 			MyHGM->read_only_action_v2(std::list<read_only_server_t> {
 				read_only_server_t { old_writer.host, (port_t)old_writer.port, 0 }
 			});

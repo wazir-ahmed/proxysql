@@ -4,7 +4,7 @@
  *
  * Test coverage:
  * 1. Replaces a pre-completion worker after definition and membership changes.
- * 2. Distinguishes irrelevant server changes from TLS and eligibility inputs.
+ * 2. Refreshes TLS and eligible membership changes in place without restarting discovery.
  * 3. Replaces a worker after writer completion using the fresh completed path.
  *
  * Probe order, departing cleanup, current runtime membership, and stale-target
@@ -187,6 +187,14 @@ Replacement_Probe_Chain wait_for_replacement_probe_chain(MYSQL* admin, RDS_BGD_S
 	return { blue_chain.table_rc, blue_chain.table, blue_chain.blue_rc, blue_chain.blue, green_rc, green };
 }
 
+int expect_no_replacement_table_check(RDS_BGD_Simulator& sim, uint64_t sequence,
+	const vector<Endpoint>& backends)
+{
+	auto [probe_rc, probe] = bgd_wait_for_probe_from_backends(sim, sequence, backends,
+		RDS_BGD_Probe_Kind::table_check, kNoReplacementTimeoutMs);
+	return probe_rc == ETIMEDOUT ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 /**
  * Replace active pre-completion input and verify one-shot departing cleanup,
  * fresh probe order, current membership, and stale-target avoidance.
@@ -333,8 +341,8 @@ void test_definition_replacement(const CommandLine& cl, MYSQL* admin, RDS_BGD_Si
 }
 
 /**
- * Verify that irrelevant weight/comment changes do not replace a worker while
- * TLS, eligible membership, and eligibility transitions do.
+ * Verify that server-input changes before writer post-processing retain the
+ * worker and refresh TLS and eligible membership in place.
  */
 void test_relevant_and_membership_changes(MYSQL* admin, RDS_BGD_Simulator& sim) {
 	// Establish an AVAILABLE metadata baseline before mutating server inputs.
@@ -375,14 +383,18 @@ void test_relevant_and_membership_changes(MYSQL* admin, RDS_BGD_Simulator& sim) 
 			bgd_sql_quote(irrelevant.green_writer.hostname) + " AND port=3306",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 	}) : EXIT_FAILURE;
-	auto tls_chain = rc == EXIT_SUCCESS ? wait_for_replacement_blue_probe_chain(admin, sim, tls_seq,
-		"irrelevant-input", irrelevant, irrelevant_hgs) :
-		Replacement_Blue_Probe_Chain { EXIT_FAILURE, {}, EXIT_FAILURE, {} };
-	ok(rc == EXIT_SUCCESS && tls_chain.table_rc == EXIT_SUCCESS && tls_chain.blue_rc == EXIT_SUCCESS &&
-		tls_chain.table.sequence_id < tls_chain.blue.sequence_id,
-		"relevant TLS input change restarts the active worker with fresh blue probes");
+	auto [tls_probe_rc, tls_probe] = rc == EXIT_SUCCESS ? bgd_wait_for_probe(sim, tls_seq,
+		irrelevant.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1, admin,
+		"irrelevant-input", "in-place TLS refresh", irrelevant_hgs.blue_writer,
+		{ irrelevant_hgs.blue_writer, irrelevant_hgs.blue_reader,
+			irrelevant_hgs.green_writer, irrelevant_hgs.green_reader }) :
+		rc_t<RDS_BGD_Probe_Log> { EXIT_FAILURE, {} };
+	int tls_no_restart_rc = tls_probe_rc == EXIT_SUCCESS ?
+		expect_no_replacement_table_check(sim, tls_seq, irrelevant_backends) : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && tls_probe_rc == EXIT_SUCCESS && tls_no_restart_rc == EXIT_SUCCESS,
+		"relevant TLS input refreshes the active worker in place");
 	ok(runtime_server_ssl(admin, irrelevant_hgs.green_writer, irrelevant.green_writer, 1),
-		"relevant TLS input change is present in the replacement runtime server row");
+		"relevant TLS input change is present in the refreshed runtime server row");
 
 	// Replace eligible membership, then move it offline and online with fixed definition fields.
 	auto [membership_seq_rc, membership_seq] = sim.probe_log_last_sequence();
@@ -394,16 +406,13 @@ void test_relevant_and_membership_changes(MYSQL* admin, RDS_BGD_Simulator& sim) 
 			bgd_sql_quote(irrelevant.green_readers[0].hostname) + " AND port=3306",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 	}) : EXIT_FAILURE;
-	auto membership_chain = rc == EXIT_SUCCESS ? wait_for_replacement_blue_probe_chain(admin, sim, membership_seq,
-		"irrelevant-input", irrelevant, irrelevant_hgs) :
-		Replacement_Blue_Probe_Chain { EXIT_FAILURE, {}, EXIT_FAILURE, {} };
-	ok(rc == EXIT_SUCCESS && membership_chain.table_rc == EXIT_SUCCESS &&
-		membership_chain.blue_rc == EXIT_SUCCESS &&
-		membership_chain.table.sequence_id < membership_chain.blue.sequence_id,
-		"eligible green membership alone restarts the active worker with fresh probes");
+	int membership_no_restart_rc = rc == EXIT_SUCCESS ?
+		expect_no_replacement_table_check(sim, membership_seq, irrelevant_backends) : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && membership_no_restart_rc == EXIT_SUCCESS,
+		"eligible green membership refreshes the active worker in place");
 	ok(runtime_server_ssl(admin, irrelevant_hgs.green_reader, irrelevant.green_readers[1], 0) &&
 		runtime_server_absent(admin, irrelevant_hgs.green_reader, irrelevant.green_readers[0]),
-		"membership replacement uses the added green reader and removes the stale reader");
+		"membership refresh uses the added green reader and removes the stale reader");
 
 	auto [offline_seq_rc, offline_seq] = sim.probe_log_last_sequence();
 	rc = offline_seq_rc == EXIT_SUCCESS ? execute_all(admin, {
@@ -411,13 +420,11 @@ void test_relevant_and_membership_changes(MYSQL* admin, RDS_BGD_Simulator& sim) 
 			bgd_sql_quote(irrelevant.green_readers[1].hostname) + " AND port=3306",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 	}) : EXIT_FAILURE;
-	auto offline_chain = rc == EXIT_SUCCESS ? wait_for_replacement_blue_probe_chain(admin, sim, offline_seq,
-		"irrelevant-input", irrelevant, irrelevant_hgs) :
-		Replacement_Blue_Probe_Chain { EXIT_FAILURE, {}, EXIT_FAILURE, {} };
-	ok(rc == EXIT_SUCCESS && offline_chain.table_rc == EXIT_SUCCESS && offline_chain.blue_rc == EXIT_SUCCESS &&
-		offline_chain.table.sequence_id < offline_chain.blue.sequence_id &&
+	int offline_no_restart_rc = rc == EXIT_SUCCESS ?
+		expect_no_replacement_table_check(sim, offline_seq, irrelevant_backends) : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && offline_no_restart_rc == EXIT_SUCCESS &&
 		persistent_server_status(admin, irrelevant_hgs.green_reader, irrelevant.green_readers[1], "OFFLINE_SOFT"),
-		"moving green membership offline alone restarts the active worker");
+		"moving green membership offline refreshes the active worker in place");
 
 	auto [online_seq_rc, online_seq] = sim.probe_log_last_sequence();
 	rc = online_seq_rc == EXIT_SUCCESS ? execute_all(admin, {
@@ -425,13 +432,11 @@ void test_relevant_and_membership_changes(MYSQL* admin, RDS_BGD_Simulator& sim) 
 			bgd_sql_quote(irrelevant.green_readers[1].hostname) + " AND port=3306",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 	}) : EXIT_FAILURE;
-	auto online_chain = rc == EXIT_SUCCESS ? wait_for_replacement_blue_probe_chain(admin, sim, online_seq,
-		"irrelevant-input", irrelevant, irrelevant_hgs) :
-		Replacement_Blue_Probe_Chain { EXIT_FAILURE, {}, EXIT_FAILURE, {} };
-	ok(rc == EXIT_SUCCESS && online_chain.table_rc == EXIT_SUCCESS && online_chain.blue_rc == EXIT_SUCCESS &&
-		online_chain.table.sequence_id < online_chain.blue.sequence_id &&
+	int online_no_restart_rc = rc == EXIT_SUCCESS ?
+		expect_no_replacement_table_check(sim, online_seq, irrelevant_backends) : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && online_no_restart_rc == EXIT_SUCCESS &&
 		persistent_server_status(admin, irrelevant_hgs.green_reader, irrelevant.green_readers[1], "ONLINE"),
-		"returning green membership online alone restarts the active worker");
+		"returning green membership online refreshes the active worker in place");
 }
 
 /**

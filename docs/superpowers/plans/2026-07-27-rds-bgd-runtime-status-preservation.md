@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Keep positive test waits at three seconds or less.
-- Do not assert or document the internal `SHUNNED_AWS_BGD` server status.
+- Do not inspect or document non-public server states.
 - Keep `test_rds_bgd_repeat_concurrent-t.cpp` unchanged as the regression test.
 
 ---
@@ -27,13 +27,13 @@
 - Consumes: `incoming_aws_rds_bgd_hostgroups`, containing configured BGD rows ordered by `writer_hostgroup`.
 - Produces: `generate_mysql_aws_rds_bgd_hostgroups_table()`, which reconciles the internal runtime table while preserving `status` for retained writer hostgroups.
 
-- [ ] **Step 1: Confirm the regression test fails for status loss**
+- [x] **Step 1: Confirm the regression test fails for status loss**
 
 Run the isolated AWS RDS BGD simulator group on the rebased feature branch.
 
 Expected: `test_rds_bgd_repeat_concurrent-t` fails assertions 35, 37, and 38 because retained workers do not republish status after the runtime table is rebuilt.
 
-- [ ] **Step 2: Remove the unconditional BGD table deletion**
+- [x] **Step 2: Remove the unconditional BGD table deletion**
 
 In `MySQL_HostGroups_Manager::commit()`, call
 `generate_mysql_aws_rds_bgd_hostgroups_table()` without first executing:
@@ -42,7 +42,7 @@ In `MySQL_HostGroups_Manager::commit()`, call
 mydb->execute("DELETE FROM mysql_aws_rds_bgd_hostgroups");
 ```
 
-- [ ] **Step 3: Reconcile retained, changed, new, and removed rows**
+- [x] **Step 3: Reconcile retained, changed, new, and removed rows**
 
 Update `generate_mysql_aws_rds_bgd_hostgroups_table()` to:
 
@@ -59,13 +59,20 @@ Use prepared statements for row updates and inserts. Preserve nullable green
 hostgroups with `sqlite3_bind_null`, set config-loaded rows to
 `auto_generated=0`, and consume `incoming_aws_rds_bgd_hostgroups` exactly once.
 
-- [ ] **Step 4: Update the function documentation**
+- [x] **Step 4: Update the function documentation**
 
 Describe reconciliation, the `writer_hostgroup` identity, status preservation,
 new-row `NONE` behavior, and changed-reader uniqueness handling in the
 declaration and definition comments.
 
-- [ ] **Step 5: Build the BGD target**
+- [x] **Step 5: Reapply in-progress writer placement after refresh**
+
+In `MySQL_Monitor::aws_rds_bgd_config_refresh_action()`, always demote the
+writer found in the refreshed topology when the worker remains in
+`WRITER_SWITCHOVER_IN_PROGRESS`. Restore the old writer only when its identity
+changed.
+
+- [x] **Step 6: Build the BGD target**
 
 Run:
 
@@ -75,22 +82,22 @@ PROXYSQL40=1 make -s -j"$(nproc)" test_rds_bgd
 
 Expected: build succeeds without errors.
 
-- [ ] **Step 6: Verify the regression passes**
+- [x] **Step 7: Verify the regression passes**
 
 Start fresh isolated infrastructure and run the BGD simulator group.
 
 Expected: `test_rds_bgd_repeat_concurrent-t` passes all assertions, including
 35, 37, and 38.
 
-- [ ] **Step 7: Verify the complete simulator group**
+- [x] **Step 8: Verify the complete simulator group**
 
 Run all registered AWS RDS BGD TAP executables against fresh infrastructure.
 
 Expected: all 11 executables pass.
 
-- [ ] **Step 8: Commit the implementation**
+- [x] **Step 9: Commit the implementation**
 
 ```bash
-git add lib/MySQL_HostGroups_Manager.cpp include/MySQL_HostGroups_Manager.h
+git add lib/MySQL_HostGroups_Manager.cpp include/MySQL_HostGroups_Manager.h lib/MySQL_Monitor.cpp
 git commit -m "fix: preserve RDS BGD runtime status on reload"
 ```

@@ -718,12 +718,12 @@ class MySQL_HostGroups_Manager : public Base_HostGroups_Manager<MyHGC> {
 	std::map<int , AWS_Aurora_Info *> AWS_Aurora_Info_Map;
 
 	/**
-	 * @brief Materializes the runtime `mysql_aws_rds_bgd_hostgroups` table from the staged
-	 *   `incoming_aws_rds_bgd_hostgroups` resultset.
+	 * @brief Reconciles runtime `mysql_aws_rds_bgd_hostgroups` rows with the staged configuration.
 	 *
-	 * @details Inserts each staged row with `auto_generated=0` (config-loaded entries are
-	 *   user-defined) and NULL green hostgroups preserved, then clears the staging resultset.
-	 *   No-op when nothing is staged.
+	 * @details Matches deployments by `writer_hostgroup`, removes missing rows, updates configured
+	 *   fields without changing runtime `status`, and inserts new rows at `NONE`. Changed reader
+	 *   hostgroups are safely reinserted with their prior status to satisfy the unique constraint.
+	 *   Config-loaded rows use `auto_generated=0`. No-op when nothing is staged.
 	 */
 	void generate_mysql_aws_rds_bgd_hostgroups_table();
 	SQLite3_result *incoming_aws_rds_bgd_hostgroups;

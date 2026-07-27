@@ -30,11 +30,18 @@ configuration are removed. An auto-generated row that becomes explicitly
 configured is updated in place, changes to `auto_generated=0`, and retains its
 current status.
 
-Worker lifecycle and per-hostgroup refresh behavior remain unchanged.
+Other worker lifecycle behavior remains unchanged.
+
+An in-progress worker must also restore its phase-specific writer placement
+after `LOAD MYSQL SERVERS TO RUNTIME` reapplies configured server placement.
+During the one-time configuration refresh action, restore the previous writer
+only when its identity changed, but always demote the writer identified by the
+fresh topology. Other lifecycle phases are unchanged.
 
 ## Verification
 
 Keep `test_rds_bgd_repeat_concurrent-t.cpp` unchanged as the regression test.
 Its replacement scenario must show that the refreshed cluster and unaffected
-clusters retain their public runtime phases after the table rebuild. Then run
-the complete AWS RDS BGD simulator TAP group to check for regressions.
+clusters retain their public runtime phases after reconciliation, and that an
+in-progress refreshed cluster reapplies its writer placement. Then run the
+complete AWS RDS BGD simulator TAP group to check for regressions.
