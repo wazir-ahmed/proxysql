@@ -10,14 +10,27 @@ publishes an incorrect runtime status until another phase transition occurs.
 
 ## Design
 
-Before rebuilding the table, snapshot each existing row's
-`writer_hostgroup,status` pair. Regenerate configured rows as today, then restore
-the saved status for writer hostgroups that still exist.
+Reconcile the runtime table against the incoming configuration, following the
+same broad process used for `mysql_servers`:
 
-- Existing deployments retain their last published lifecycle status.
-- Newly configured deployments start at the schema default, `NONE`.
-- Removed deployments are not restored.
-- Worker lifecycle and per-hostgroup refresh behavior remain unchanged.
+1. Delete runtime rows whose `writer_hostgroup` is absent from the incoming
+   configuration.
+2. Update configured columns on existing rows, matching by `writer_hostgroup`
+   and deliberately excluding the runtime-only `status` column.
+3. Insert newly configured rows with the schema-default `NONE` status.
+
+`reader_hostgroup` is unique. Existing rows whose reader hostgroup changes are
+therefore removed before any replacement rows are inserted, avoiding transient
+uniqueness conflicts such as two deployments swapping reader hostgroups. Their
+current status is carried into the replacement row because the deployment
+identity, `writer_hostgroup`, is unchanged.
+
+Runtime-only auto-generated rows that are absent from the incoming
+configuration are removed. An auto-generated row that becomes explicitly
+configured is updated in place, changes to `auto_generated=0`, and retains its
+current status.
+
+Worker lifecycle and per-hostgroup refresh behavior remain unchanged.
 
 ## Verification
 
