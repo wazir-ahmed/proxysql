@@ -1,6 +1,14 @@
 /**
  * @file test_rds_bgd_discovery-t.cpp
  * @brief Discovery ordering coverage for AWS RDS Blue/Green Deployments.
+ *
+ * Test coverage:
+ * 1. Discovers a deployment whose topology exists before its blue writer.
+ * 2. Keeps discovery idle while topology is absent, then starts on AVAILABLE.
+ * 3. Replaces an automatic worker when blue readers join after startup.
+ *
+ * Each scenario also verifies that automatic rows remain runtime-only and that
+ * client routing continues to identify the configured blue writer.
  */
 
 #include <cstdlib>
@@ -53,24 +61,12 @@ void set_read_only_writers(RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster) {
 	}
 }
 
-}  // namespace
-
-int main() {
-	plan(18);
-
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// Scenario 1: topology exists before the blue writer is added.
+/**
+ * Publish topology first, then add the blue writer and verify that automatic
+ * discovery creates one runtime-only worker with working client routing.
+ */
+void test_topology_before_writer(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Reset Admin state and publish AVAILABLE before ProxySQL knows the blue writer.
 	RDS_BGD_Cluster first = bgd_cluster_init();
 	BGD_Hostgroups first_hgs { 810, 811, 812, 813 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS) BAIL_OUT("failed to clean Admin state for topology-first discovery");
@@ -108,13 +104,19 @@ int main() {
 	ok(first_echo_rc == EXIT_SUCCESS && first_echo.find(first.blue_writer.ip) != string::npos &&
 		first_pool_rc == EXIT_SUCCESS && first_pool >= 1,
 		"topology-first: client backend echo and pool state identify the configured blue writer");
+}
 
-	// Scenario 2: blue topology is configured before AWS exposes mysql.rds_topology.
+/**
+ * Start automatic discovery while topology is absent, then publish AVAILABLE
+ * and verify that exactly one runtime-only worker is created.
+ */
+void test_topology_absent_then_available(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure the blue deployment against an explicitly absent topology.
 	RDS_BGD_Cluster second = bgd_cluster_2_init();
 	BGD_Hostgroups second_hgs { 820, 821, 822, 823 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS) BAIL_OUT("failed to clean Admin state for topology-absent discovery");
 	set_read_only_writers(sim, second);
-	rc = sim.topology_drop(topology_backends(second, true));
+	int rc = sim.topology_drop(topology_backends(second, true));
 	ok(rc == EXIT_SUCCESS, "topology-absent: publish the recorded absent-topology condition");
 	if (rc != EXIT_SUCCESS) BAIL_OUT("failed to publish topology-absent condition");
 	auto [second_seq_rc, second_seq] = sim.probe_log_last_sequence();
@@ -130,6 +132,8 @@ int main() {
 	ok(second_absent_probe_rc == EXIT_SUCCESS && no_persistent_bgd_row(admin, second_hgs.blue_writer) &&
 		second_absent_rows_rc == EXIT_SUCCESS && second_absent_rows.empty(),
 		"topology-absent: read-only discovery observes absence and creates no BGD row");
+
+	// Publish AVAILABLE and verify that discovery now creates and starts one worker.
 	auto [second_available_seq_rc, second_available_seq] = sim.probe_log_last_sequence();
 	if (second_available_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read AVAILABLE publication probe sequence");
 	rc = sim.topology_update(topology_backends(second, true), second.get_topology("AVAILABLE"));
@@ -149,13 +153,19 @@ int main() {
 	ok(second_count_rc == EXIT_SUCCESS && second_count_rows.size() == 1 && second_count_rows[0].size() == 1 &&
 		second_count_rows[0][0] == "1" && no_persistent_bgd_row(admin, second_hgs.blue_writer),
 		"topology-absent: repeated discovery leaves one runtime-only BGD row");
+}
 
-	// Scenario 3: readers appear only after the automatic worker has started.
+/**
+ * Add blue readers after a writer-only automatic worker has started and verify
+ * that replacement refreshes the probe set without changing blue routing.
+ */
+void test_late_reader_membership(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Start automatic discovery with only the blue writer configured.
 	RDS_BGD_Cluster third = bgd_cluster_3_init();
 	BGD_Hostgroups third_hgs { 830, 831, 832, 833 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS) BAIL_OUT("failed to clean Admin state for late-reader discovery");
 	set_read_only_writers(sim, third);
-	rc = sim.topology_update(topology_backends(third, true), third.get_topology("AVAILABLE"));
+	int rc = sim.topology_update(topology_backends(third, true), third.get_topology("AVAILABLE"));
 	ok(rc == EXIT_SUCCESS, "late-readers: publish recorded AVAILABLE observations before starting automatic discovery");
 	if (rc != EXIT_SUCCESS) BAIL_OUT("failed to publish late-reader AVAILABLE observations");
 	auto [third_seq_rc, third_seq] = sim.probe_log_last_sequence();
@@ -169,6 +179,8 @@ int main() {
 		{ third_hgs.blue_writer, third_hgs.blue_reader });
 	ok(rc == EXIT_SUCCESS && runtime_auto_row_matches(admin, third_hgs),
 		"late-readers: writer-only automatic discovery creates the expected runtime row");
+
+	// Add distinct-TLS readers and verify worker replacement probes the refreshed set.
 	auto [third_reader_seq_rc, third_reader_seq] = sim.probe_log_last_sequence();
 	if (third_reader_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read late-reader baseline probe sequence");
 	rc = bgd_admin_add_servers(admin, third, third_hgs, third.blue_readers, false, 1);
@@ -214,6 +226,28 @@ int main() {
 		third_echo_rc == EXIT_SUCCESS && third_echo.find(third.blue_writer.ip) != string::npos &&
 		third_pool_rc == EXIT_SUCCESS && third_pool >= 1,
 		"late-readers: derived hostgroups remain singular and client pool routing stays on the blue writer");
+}
+
+}  // namespace
+
+int main() {
+	plan(18);
+
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_topology_before_writer(cl, admin, sim);
+	test_topology_absent_then_available(admin, sim);
+	test_late_reader_membership(cl, admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final BGD TAP state");

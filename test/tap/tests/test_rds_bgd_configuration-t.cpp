@@ -1,6 +1,12 @@
 /**
  * @file test_rds_bgd_configuration-t.cpp
  * @brief Explicit AWS RDS Blue/Green configuration and persistence coverage.
+ *
+ * Test coverage:
+ * 1. Starts workers when explicit rows and eligible servers arrive in either order.
+ * 2. Accepts green membership before discovery, after discovery, or after worker startup.
+ * 3. Converts an automatic runtime row into explicit persistent configuration.
+ * 4. Validates required green hostgroups and SAVE-from-runtime behavior.
  */
 
 #include <cerrno>
@@ -164,23 +170,12 @@ bool pool_and_backend_are_blue(const CommandLine& cl, MYSQL* admin, RDS_BGD_Clus
 		pool_rc == EXIT_SUCCESS && pool >= 1;
 }
 
-}  // namespace
-
-int main() {
-	plan(15);
-
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// Explicit configuration loaded before any eligible blue server.
+/**
+ * Load an explicit BGD definition before eligible servers and verify that the
+ * worker starts only after the blue server set is loaded.
+ */
+void test_explicit_before_servers(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Publish AVAILABLE, then load the explicit definition without eligible servers.
 	RDS_BGD_Cluster first = bgd_cluster_init();
 	BGD_Hostgroups first_hgs { 840, 841, 842, 843 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(cluster_backends(first)) != EXIT_SUCCESS) {
@@ -213,15 +208,21 @@ int main() {
 		explicit_runtime_row_matches(admin, first_hgs, "AVAILABLE") && runtime_membership_matches(admin, first, first_hgs) &&
 		pool_and_backend_are_blue(cl, admin, first, first_hgs),
 		"explicit-before-servers: blue-server load starts monitoring with the expected runtime membership, client backend, and pool");
+}
 
-	// Servers may exist before the explicit row, but cannot start a BGD worker without it.
+/**
+ * Load all servers before the explicit BGD definition and verify that the
+ * definition load is the event that starts monitoring.
+ */
+void test_servers_before_explicit(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Load blue and green servers while the explicit BGD row is still absent.
 	RDS_BGD_Cluster second = bgd_cluster_2_init();
 	BGD_Hostgroups second_hgs { 850, 851, 852, 853 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(cluster_backends(second)) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to reset servers-before-explicit scenario");
 	}
 	set_writers_writable(sim, second);
-	rc = sim.topology_update(cluster_backends(second), topology_with_readers(second, "AVAILABLE"));
+	int rc = sim.topology_update(cluster_backends(second), topology_with_readers(second, "AVAILABLE"));
 	if (rc != EXIT_SUCCESS || configure_monitor(admin, second_hgs, false) != EXIT_SUCCESS ||
 		add_all_servers(admin, second, second_hgs) != EXIT_SUCCESS) BAIL_OUT("failed to add servers before explicit row");
 	auto [second_seq_rc, second_seq] = sim.probe_log_last_sequence();
@@ -238,8 +239,14 @@ int main() {
 	ok(rc == EXIT_SUCCESS && second_available_rc == EXIT_SUCCESS && explicit_runtime_row_matches(admin, second_hgs, "AVAILABLE") &&
 		runtime_membership_matches(admin, second, second_hgs) && pool_and_backend_are_blue(cl, admin, second, second_hgs),
 		"servers-before-explicit: loading the row starts the worker with explicit membership, blue routing, and pool state");
+}
 
-	// Green members may be supplied before the first AVAILABLE observation.
+/**
+ * Supply complete green membership before the first AVAILABLE observation and
+ * verify that discovery converges on that membership.
+ */
+void test_green_members_before_available(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure the complete explicit membership before publishing topology.
 	RDS_BGD_Cluster third = bgd_cluster_3_init();
 	BGD_Hostgroups third_hgs { 860, 861, 862, 863 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(cluster_backends(third)) != EXIT_SUCCESS) {
@@ -250,20 +257,26 @@ int main() {
 		add_all_servers(admin, third, third_hgs) != EXIT_SUCCESS) BAIL_OUT("failed to configure green-before-available scenario");
 	auto [third_seq_rc, third_seq] = sim.probe_log_last_sequence();
 	if (third_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read green-before-available probe baseline");
-	rc = sim.topology_update(cluster_backends(third), topology_with_readers(third, "AVAILABLE"));
+	int rc = sim.topology_update(cluster_backends(third), topology_with_readers(third, "AVAILABLE"));
 	int third_available_rc = rc == EXIT_SUCCESS ? wait_for_available(admin, sim, third_seq,
 		"green-before-available", third, third_hgs) : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && third_available_rc == EXIT_SUCCESS && runtime_membership_matches(admin, third, third_hgs),
 		"green-before-available: members supplied before AVAILABLE converge on the complete runtime membership");
+}
 
-	// Green members may also arrive after the first AVAILABLE discovery.
+/**
+ * Start discovery with blue membership only, then add green members and verify
+ * that the active worker adopts the complete set.
+ */
+void test_green_members_after_discovery(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Reach AVAILABLE with blue members before loading the configured green set.
 	RDS_BGD_Cluster fourth = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups fourth_hgs { 870, 871, 872, 873 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(cluster_backends(fourth)) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to reset green-after-discovery scenario");
 	}
 	set_writers_writable(sim, fourth);
-	rc = sim.topology_update(cluster_backends(fourth), topology_with_readers(fourth, "AVAILABLE"));
+	int rc = sim.topology_update(cluster_backends(fourth), topology_with_readers(fourth, "AVAILABLE"));
 	if (rc != EXIT_SUCCESS || configure_monitor(admin, fourth_hgs, false) != EXIT_SUCCESS ||
 		insert_explicit_row(admin, fourth_hgs, "green after discovery") != EXIT_SUCCESS ||
 		bgd_admin_add_servers(admin, fourth, fourth_hgs,
@@ -291,8 +304,14 @@ int main() {
 		fourth_green_probe_rc == EXIT_SUCCESS &&
 		runtime_membership_matches(admin, fourth, fourth_hgs),
 		"green-after-discovery: members added after discovery converge on the same complete runtime membership");
+}
 
-	// A worker can start on absent topology before green membership is provided.
+/**
+ * Start an explicit worker against absent topology, then add green membership
+ * before AVAILABLE and verify normal convergence.
+ */
+void test_green_members_after_worker_start(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Start the worker with blue membership while topology and green members are absent.
 	RDS_BGD_Cluster fifth = bgd_cluster_init();
 	BGD_Hostgroups fifth_hgs { 880, 881, 882, 883 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(cluster_backends(fifth)) != EXIT_SUCCESS) {
@@ -310,7 +329,7 @@ int main() {
 	auto [fifth_start_rc, fifth_start] = bgd_wait_for_probe(sim, fifth_seq, fifth.blue_writer.endpoint(),
 		RDS_BGD_Probe_Kind::table_check, kProbeTimeoutMs, 0, admin, "green-after-worker-start", "worker start",
 		fifth_hgs.blue_writer, { fifth_hgs.blue_writer, fifth_hgs.blue_reader, fifth_hgs.green_writer, fifth_hgs.green_reader });
-	rc = bgd_admin_add_servers(admin, fifth, fifth_hgs,
+	int rc = bgd_admin_add_servers(admin, fifth, fifth_hgs,
 		{ fifth.green_writer, fifth.green_readers[0], fifth.green_readers[1] }, true, 1);
 	if (rc == EXIT_SUCCESS) rc = execute_all(admin, { "LOAD MYSQL SERVERS TO RUNTIME" });
 	int fifth_topology_rc = rc == EXIT_SUCCESS ? sim.topology_update(cluster_backends(fifth), topology_with_readers(fifth, "AVAILABLE")) : EXIT_FAILURE;
@@ -319,15 +338,21 @@ int main() {
 	ok(fifth_start_rc == EXIT_SUCCESS && rc == EXIT_SUCCESS && fifth_topology_rc == EXIT_SUCCESS && fifth_available_rc == EXIT_SUCCESS &&
 		runtime_membership_matches(admin, fifth, fifth_hgs),
 		"green-after-worker-start: members added before switchover converge on the same complete runtime membership");
+}
 
-	// Convert a discovered automatic row to user configuration.
+/**
+ * Replace a nullable automatic runtime row with a complete user-owned row and
+ * verify that the explicit values persist.
+ */
+void test_automatic_to_explicit_conversion(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Discover the automatic row first, then disable discovery and load explicit values.
 	RDS_BGD_Cluster sixth = bgd_cluster_2_init();
 	BGD_Hostgroups sixth_hgs { 890, 891, 892, 893 };
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS || sim.topology_drop(cluster_backends(sixth)) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to reset automatic-conversion scenario");
 	}
 	set_writers_writable(sim, sixth);
-	rc = sim.topology_update(cluster_backends(sixth), topology_with_readers(sixth, "AVAILABLE"));
+	int rc = sim.topology_update(cluster_backends(sixth), topology_with_readers(sixth, "AVAILABLE"));
 	if (rc != EXIT_SUCCESS || configure_monitor(admin, sixth_hgs, true) != EXIT_SUCCESS ||
 		bgd_admin_add_servers(admin, sixth, sixth_hgs, { sixth.blue_writer }, false, 0) != EXIT_SUCCESS ||
 		execute_all(admin, { "LOAD MYSQL SERVERS TO RUNTIME" }) != EXIT_SUCCESS) BAIL_OUT("failed to configure automatic conversion");
@@ -349,8 +374,14 @@ int main() {
 		sixth_hgs.blue_writer, { sixth_hgs.blue_writer, sixth_hgs.blue_reader, sixth_hgs.green_writer, sixth_hgs.green_reader }) : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && sixth_explicit_rc == EXIT_SUCCESS && explicit_runtime_row_matches(admin, sixth_hgs) && persistent_row_matches(admin, sixth_hgs),
 		"automatic-conversion: explicit configuration replaces nullable automatic values and persists as user state");
+}
 
-	// The persistent table rejects NULL green hostgroups; valid user rows load as explicit.
+/**
+ * Verify that persistent user rows require both green hostgroups while a
+ * complete row loads into runtime as explicit configuration.
+ */
+void test_persistent_row_validation(MYSQL* admin) {
+	// Attempt both invalid NULL variants before loading one complete row.
 	if (bgd_admin_cleanup(admin) != EXIT_SUCCESS) BAIL_OUT("failed to reset persistent validation scenario");
 	int null_writer_rc = mysql_query(admin,
 		"INSERT INTO mysql_aws_rds_bgd_hostgroups(writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup) VALUES (900,901,NULL,903)");
@@ -365,8 +396,14 @@ int main() {
 		execute_all(admin, { "LOAD MYSQL SERVERS TO RUNTIME" }) != EXIT_SUCCESS) BAIL_OUT("failed to load valid persistent row");
 	ok(persistent_row_matches(admin, valid_hgs) && explicit_runtime_row_matches(admin, valid_hgs),
 		"persistent-validation: a valid user row with both green hostgroups loads with auto_generated=0");
+}
 
-	// SAVE retains explicit config but does not serialize automatic runtime discoveries.
+/**
+ * SAVE BGD runtime state and verify that it recreates explicit configuration
+ * without serializing an automatic discovery row.
+ */
+void test_save_from_runtime(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Run explicit and automatic workers together, then remove the persistent explicit row.
 	RDS_BGD_Cluster explicit_save = bgd_cluster_3_init();
 	RDS_BGD_Cluster automatic_save = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups explicit_save_hgs { 920, 921, 922, 923 };
@@ -408,6 +445,32 @@ int main() {
 		explicit_absent_before_save && save_rc == EXIT_SUCCESS && persistent_row_matches(admin, explicit_save_hgs) &&
 		persistent_row_absent(admin, automatic_save_hgs.blue_writer),
 		"save-from-runtime: SAVE recreates the missing explicit BGD row and skips the automatic runtime row");
+}
+
+}  // namespace
+
+int main() {
+	plan(15);
+
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_explicit_before_servers(cl, admin, sim);
+	test_servers_before_explicit(cl, admin, sim);
+	test_green_members_before_available(admin, sim);
+	test_green_members_after_discovery(admin, sim);
+	test_green_members_after_worker_start(admin, sim);
+	test_automatic_to_explicit_conversion(admin, sim);
+	test_persistent_row_validation(admin);
+	test_save_from_runtime(admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final BGD TAP state");

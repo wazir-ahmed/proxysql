@@ -2,12 +2,11 @@
  * @file test_rds_bgd_smoke-t.cpp
  * @brief Smoke test for TAP-controlled AWS RDS BGD simulation.
  *
- * Test steps:
- * 1. Connect to ProxySQL Admin and the SQLite3-server simulator.
- * 2. Configure both simulated writers as writable.
- * 3. Publish an AVAILABLE topology on the blue and green writer IPs.
- * 4. Configure ProxySQL with the blue writer and BGD hostgroups.
- * 5. Verify that ProxySQL reaches AVAILABLE and probes the green writer IP.
+ * Test coverage:
+ * 1. Publishes an AVAILABLE topology for writable blue and green writers.
+ * 2. Starts an explicitly configured BGD worker for the blue writer.
+ * 3. Verifies the public AVAILABLE state and a plaintext metadata probe to
+ *    the recorded green writer.
  */
 
 #include <cstdlib>
@@ -41,6 +40,48 @@ int configure_proxysql_for_bgd(MYSQL* admin, RDS_BGD_Cluster& cluster) {
 	});
 }
 
+/**
+ * Exercise the shortest successful BGD path from recorded AVAILABLE topology
+ * through worker startup and direct green-writer probing.
+ */
+void test_available_discovery(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Prepare writable writers so both recorded endpoints accept monitor probes.
+	RDS_BGD_Cluster cluster = bgd_cluster_init();
+	for (Endpoint& writer : cluster.get_writer_hosts()) {
+		if (sim.read_only_update(writer, false) != EXIT_SUCCESS) {
+			BAIL_OUT("failed to configure writer read_only state");
+		}
+	}
+
+	// Establish the probe baseline, then publish the topology before starting the worker.
+	auto [rc, last_seq] = sim.probe_log_last_sequence();
+	if (rc != EXIT_SUCCESS) {
+		BAIL_OUT("failed to read the last BGD probe-log sequence");
+	}
+	rc = sim.topology_update(cluster.get_writers(), cluster.get_topology("AVAILABLE"));
+	ok(rc == EXIT_SUCCESS, "publish AVAILABLE topology to both writer IPs");
+	if (rc != EXIT_SUCCESS) {
+		BAIL_OUT("failed to publish BGD topology");
+	}
+
+	// Enable explicit BGD monitoring and wait for its public runtime state.
+	if (configure_proxysql_for_bgd(admin, cluster) != EXIT_SUCCESS) {
+		BAIL_OUT("failed to configure ProxySQL for BGD monitoring");
+	}
+	rc = wait_for_cond(
+		admin,
+		"SELECT COUNT(*)=1 FROM runtime_mysql_aws_rds_bgd_hostgroups "
+		"WHERE writer_hostgroup=10 AND status='AVAILABLE'",
+		3);
+	ok(rc == EXIT_SUCCESS, "ProxySQL enters the AVAILABLE BGD state");
+
+	// Confirm that topology discovery selected the recorded green writer endpoint.
+	auto [probe_rc, green_probe] = sim.wait_for_probe_log(
+		last_seq, cluster.green_writer.endpoint(),
+		RDS_BGD_Probe_Kind::metadata, 3000, 0);
+	ok(probe_rc == EXIT_SUCCESS, "ProxySQL probes topology directly on the green writer IP over plaintext");
+}
+
 int main() {
 	plan(3);
 
@@ -61,45 +102,7 @@ int main() {
 	}
 	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
-	// Initialize the test cluster and make both simulated writers writable.
-	RDS_BGD_Cluster cluster = bgd_cluster_init();
-	for (Endpoint& writer : cluster.get_writer_hosts()) {
-		if (sim.read_only_update(writer, false) != EXIT_SUCCESS) {
-			BAIL_OUT("failed to configure writer read_only state");
-		}
-	}
-
-	// Record the last probe sequence before enabling BGD monitoring.
-	auto [rc, last_seq] = sim.probe_log_last_sequence();
-	if (rc != EXIT_SUCCESS) {
-		BAIL_OUT("failed to read the last BGD probe-log sequence");
-	}
-
-	// Publish the AVAILABLE topology on both simulated writer IPs.
-	rc = sim.topology_update(cluster.get_writers(), cluster.get_topology("AVAILABLE"));
-	ok(rc == EXIT_SUCCESS, "publish AVAILABLE topology to both writer IPs");
-	if (rc != EXIT_SUCCESS) {
-		BAIL_OUT("failed to publish BGD topology");
-	}
-
-	// Configure ProxySQL with the blue writer and BGD hostgroups.
-	if (configure_proxysql_for_bgd(admin, cluster) != EXIT_SUCCESS) {
-		BAIL_OUT("failed to configure ProxySQL for BGD monitoring");
-	}
-
-	// Wait for topology discovery to place the BGD hostgroups in AVAILABLE.
-	rc = wait_for_cond(
-		admin,
-		"SELECT COUNT(*)=1 FROM runtime_mysql_aws_rds_bgd_hostgroups "
-		"WHERE writer_hostgroup=10 AND status='AVAILABLE'",
-		3);
-	ok(rc == EXIT_SUCCESS, "ProxySQL enters the AVAILABLE BGD state");
-
-	// Verify that ProxySQL probes metadata directly on the green writer IP.
-	auto [probe_rc, green_probe] = sim.wait_for_probe_log(
-		last_seq, cluster.green_writer.endpoint(),
-		RDS_BGD_Probe_Kind::metadata, 3000, 0);
-	ok(probe_rc == EXIT_SUCCESS, "ProxySQL probes topology directly on the green writer IP over plaintext");
+	test_available_discovery(admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final smoke TAP state");

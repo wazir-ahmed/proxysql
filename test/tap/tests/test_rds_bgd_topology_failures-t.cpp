@@ -1,6 +1,15 @@
 /**
  * @file test_rds_bgd_topology_failures-t.cpp
  * @brief AWS RDS Blue/Green topology absence and metadata-failure coverage.
+ *
+ * Test coverage:
+ * 1. Distinguishes present-empty and absent topology before completion.
+ * 2. Applies successful cleanup for both conditions during reader switchover.
+ * 3. Treats metadata error 1146 as topology absence in both lifecycle regions.
+ * 4. Preserves the active phase for a generic metadata failure.
+ *
+ * The scenarios verify public placement, connection-pool effects, retained
+ * configured rows, and the observable metadata-versus-table-check probe path.
  */
 
 #include <cstdlib>
@@ -193,22 +202,12 @@ bool telemetry_has_kind(RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint back
 	return rc == EXIT_SUCCESS && count > 0;
 }
 
-}  // namespace
-
-int main() {
-	plan(13);
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// Present-but-empty pre-completion topology is rollback, not green cleanup.
+/**
+ * Delete topology rows before completion while the table remains present and
+ * verify blue rollback without green pool cleanup.
+ */
+void test_present_empty_before_completion(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Enter in-progress with nonzero green pools, then publish an empty topology.
 	RDS_BGD_Cluster empty_pre = bgd_cluster_init();
 	BGD_Hostgroups empty_pre_hgs { 1100, 1101, 1102, 1103 };
 	vector<Endpoint> empty_pre_backends = topology_backends(empty_pre);
@@ -237,8 +236,14 @@ int main() {
 		"pre-completion successful empty metadata rolls back blue placement and leaves green rows and pools intact");
 	ok(telemetry_has_kind(sim, empty_pre_seq, empty_pre.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata),
 		"present-empty topology records a successful metadata probe on the direct green backend");
+}
 
-	// Absent pre-completion topology follows the same rollback policy but has a table-check path.
+/**
+ * Drop the topology table before completion and verify the same rollback policy
+ * through the distinguishable table-check path.
+ */
+void test_absent_before_completion(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Enter in-progress with nonzero green pools, then make topology absent.
 	RDS_BGD_Cluster absent_pre = bgd_cluster_2_init();
 	BGD_Hostgroups absent_pre_hgs { 1110, 1111, 1112, 1113 };
 	vector<Endpoint> absent_pre_backends = topology_backends(absent_pre);
@@ -247,8 +252,9 @@ int main() {
 	if (bgd_admin_setup(admin, absent_pre, absent_pre_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ absent_pre.blue_writer, absent_pre.blue_readers[0], absent_pre.blue_readers[1] },
 		{ absent_pre.green_writer, absent_pre.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure absent rollback scenario");
-	rc = enter_in_progress(admin, sim, absent_pre, absent_pre_hgs, "precompletion-absent", sequence);
-	pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, absent_pre_hgs) : EXIT_FAILURE;
+	uint64_t sequence = 0;
+	int rc = enter_in_progress(admin, sim, absent_pre, absent_pre_hgs, "precompletion-absent", sequence);
+	int pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, absent_pre_hgs) : EXIT_FAILURE;
 	auto [absent_pre_writer_pool_rc, absent_pre_writer_pool] = bgd_connection_pool_count(admin, absent_pre_hgs.green_writer);
 	auto [absent_pre_reader_pool_rc, absent_pre_reader_pool] = bgd_connection_pool_count(admin, absent_pre_hgs.green_reader);
 	auto [absent_pre_seq_rc, absent_pre_seq] = sim.probe_log_last_sequence();
@@ -264,8 +270,16 @@ int main() {
 		"pre-completion absent topology restores blue placement without draining green pools");
 	ok(telemetry_has_kind(sim, absent_pre_seq, absent_pre.blue_writer.endpoint(), RDS_BGD_Probe_Kind::table_check),
 		"dropped topology records an absent-table table-check instead of successful empty metadata");
+}
 
-	// Present-empty topology in reader switchover is successful cleanup.
+/**
+ * Delete topology rows during reader switchover and verify successful reader
+ * restoration plus green pool draining.
+ */
+void test_present_empty_during_reader_switchover(
+	const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim)
+{
+	// Enter reader switchover with nonzero green pools, then empty the topology.
 	RDS_BGD_Cluster empty_reader = bgd_cluster_3_init();
 	BGD_Hostgroups empty_reader_hgs { 1120, 1121, 1122, 1123 };
 	vector<Endpoint> empty_reader_backends = topology_backends(empty_reader);
@@ -274,8 +288,9 @@ int main() {
 	if (bgd_admin_setup(admin, empty_reader, empty_reader_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ empty_reader.blue_writer, empty_reader.blue_readers[0], empty_reader.blue_readers[1] },
 		{ empty_reader.green_writer, empty_reader.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure reader present-empty scenario");
-	rc = enter_reader_switchover(admin, sim, empty_reader, empty_reader_hgs, "reader-present-empty", sequence);
-	pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, empty_reader_hgs) : EXIT_FAILURE;
+	uint64_t sequence = 0;
+	int rc = enter_reader_switchover(admin, sim, empty_reader, empty_reader_hgs, "reader-present-empty", sequence);
+	int pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, empty_reader_hgs) : EXIT_FAILURE;
 	int empty_reader_baseline_rc = pools_rc == EXIT_SUCCESS ? wait_for_green_pool_baseline(admin, sim, sequence,
 		"reader-present-empty", empty_reader_hgs, "green pool baseline") : EXIT_FAILURE;
 	auto [empty_reader_writer_pool_rc, empty_reader_writer_pool] = bgd_connection_pool_count(admin, empty_reader_hgs.green_writer);
@@ -295,8 +310,16 @@ int main() {
 		"reader-switchover successful empty metadata restores readers, drains both green pools, and retains green rows");
 	ok(telemetry_has_kind(sim, empty_reader_seq, empty_reader.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata),
 		"reader-switchover empty topology is observed through successful direct metadata");
+}
 
-	// Absent topology in reader switchover chooses the same successful cleanup path.
+/**
+ * Drop the topology table during reader switchover and verify successful
+ * cleanup through the table-check path.
+ */
+void test_absent_during_reader_switchover(
+	const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim)
+{
+	// Enter reader switchover with nonzero green pools, then drop topology.
 	RDS_BGD_Cluster absent_reader = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups absent_reader_hgs { 1130, 1131, 1132, 1133 };
 	vector<Endpoint> absent_reader_backends = topology_backends(absent_reader);
@@ -305,8 +328,9 @@ int main() {
 	if (bgd_admin_setup(admin, absent_reader, absent_reader_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ absent_reader.blue_writer, absent_reader.blue_readers[0], absent_reader.blue_readers[1] },
 		{ absent_reader.green_writer, absent_reader.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure reader absent scenario");
-	rc = enter_reader_switchover(admin, sim, absent_reader, absent_reader_hgs, "reader-absent", sequence);
-	pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, absent_reader_hgs) : EXIT_FAILURE;
+	uint64_t sequence = 0;
+	int rc = enter_reader_switchover(admin, sim, absent_reader, absent_reader_hgs, "reader-absent", sequence);
+	int pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, absent_reader_hgs) : EXIT_FAILURE;
 	int absent_reader_baseline_rc = pools_rc == EXIT_SUCCESS ? wait_for_green_pool_baseline(admin, sim, sequence,
 		"reader-absent", absent_reader_hgs, "green pool baseline") : EXIT_FAILURE;
 	auto [absent_reader_writer_pool_rc, absent_reader_writer_pool] = bgd_connection_pool_count(admin, absent_reader_hgs.green_writer);
@@ -326,8 +350,14 @@ int main() {
 		"reader-switchover absent topology drains both green pools and performs successful cleanup rather than blue rollback");
 	ok(telemetry_has_kind(sim, absent_reader_seq, absent_reader.blue_writer.endpoint(), RDS_BGD_Probe_Kind::table_check),
 		"reader-switchover dropped topology remains distinguishable as a table-check observation");
+}
 
-	// A direct metadata 1146 falls back to table checking and applies pre-completion rollback.
+/**
+ * Return metadata error 1146 before completion and verify immediate rollback
+ * followed by a return to table checking.
+ */
+void test_metadata_1146_before_completion(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Enter in-progress, inject 1146 on the direct green probe, then drop blue topology.
 	RDS_BGD_Cluster error_1146_pre = bgd_cluster_init();
 	BGD_Hostgroups error_1146_pre_hgs { 1140, 1141, 1142, 1143 };
 	vector<Endpoint> error_1146_pre_backends = topology_backends(error_1146_pre);
@@ -336,7 +366,8 @@ int main() {
 	if (bgd_admin_setup(admin, error_1146_pre, error_1146_pre_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ error_1146_pre.blue_writer, error_1146_pre.blue_readers[0], error_1146_pre.blue_readers[1] },
 		{ error_1146_pre.green_writer, error_1146_pre.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure 1146 rollback scenario");
-	rc = enter_in_progress(admin, sim, error_1146_pre, error_1146_pre_hgs, "metadata-1146-precompletion", sequence);
+	uint64_t sequence = 0;
+	int rc = enter_in_progress(admin, sim, error_1146_pre, error_1146_pre_hgs, "metadata-1146-precompletion", sequence);
 	auto [error_1146_pre_seq_rc, error_1146_pre_seq] = sim.probe_log_last_sequence();
 	rc = rc == EXIT_SUCCESS && error_1146_pre_seq_rc == EXIT_SUCCESS ?
 		sim.topology_error({ error_1146_pre.green_writer.endpoint() }, 1146, "Table 'mysql.rds_topology' doesn't exist") : EXIT_FAILURE;
@@ -358,8 +389,16 @@ int main() {
 		error_1146_none_rc == EXIT_SUCCESS && error_1146_rollback_rc == EXIT_SUCCESS && error_1146_table_rc == EXIT_SUCCESS &&
 		error_1146_metadata.sequence_id < error_1146_table.sequence_id,
 		"metadata error 1146 immediately applies pre-completion rollback, then returns to table checking");
+}
 
-	// The same 1146 path uses reader cleanup after completion.
+/**
+ * Return metadata error 1146 during reader switchover and verify successful
+ * cleanup before table checking resumes.
+ */
+void test_metadata_1146_during_reader_switchover(
+	const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim)
+{
+	// Enter reader switchover with green pools, then inject 1146 on direct metadata.
 	RDS_BGD_Cluster error_1146_reader = bgd_cluster_2_init();
 	BGD_Hostgroups error_1146_reader_hgs { 1150, 1151, 1152, 1153 };
 	vector<Endpoint> error_1146_reader_backends = topology_backends(error_1146_reader);
@@ -368,8 +407,9 @@ int main() {
 	if (bgd_admin_setup(admin, error_1146_reader, error_1146_reader_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ error_1146_reader.blue_writer, error_1146_reader.blue_readers[0], error_1146_reader.blue_readers[1] },
 		{ error_1146_reader.green_writer, error_1146_reader.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure 1146 reader scenario");
-	rc = enter_reader_switchover(admin, sim, error_1146_reader, error_1146_reader_hgs, "metadata-1146-reader", sequence);
-	pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, error_1146_reader_hgs) : EXIT_FAILURE;
+	uint64_t sequence = 0;
+	int rc = enter_reader_switchover(admin, sim, error_1146_reader, error_1146_reader_hgs, "metadata-1146-reader", sequence);
+	int pools_rc = rc == EXIT_SUCCESS ? establish_green_pools(cl, admin, error_1146_reader_hgs) : EXIT_FAILURE;
 	int error_1146_reader_baseline_rc = pools_rc == EXIT_SUCCESS ? wait_for_green_pool_baseline(admin, sim, sequence,
 		"metadata-1146-reader", error_1146_reader_hgs, "green pool baseline") : EXIT_FAILURE;
 	auto [error_1146_reader_writer_pool_rc, error_1146_reader_writer_pool] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_writer);
@@ -387,7 +427,8 @@ int main() {
 		error_1146_reader_metadata.sequence_id, "metadata-1146-reader", error_1146_reader_hgs, "successful cleanup") : EXIT_FAILURE;
 	auto [error_1146_reader_after_writer_rc, error_1146_reader_after_writer] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_writer);
 	auto [error_1146_reader_after_reader_rc, error_1146_reader_after_reader] = bgd_connection_pool_count(admin, error_1146_reader_hgs.green_reader);
-	drop_after_1146_rc = error_1146_reader_drain_rc == EXIT_SUCCESS ? sim.topology_drop({ error_1146_reader.blue_writer.endpoint() }) : EXIT_FAILURE;
+	int drop_after_1146_rc = error_1146_reader_drain_rc == EXIT_SUCCESS ?
+		sim.topology_drop({ error_1146_reader.blue_writer.endpoint() }) : EXIT_FAILURE;
 	const uint64_t reader_table_baseline = error_1146_reader_metadata_rc == EXIT_SUCCESS ? error_1146_reader_metadata.sequence_id : error_1146_reader_seq;
 	auto [error_1146_reader_table_rc, error_1146_reader_table] = drop_after_1146_rc == EXIT_SUCCESS ? bgd_wait_for_probe(sim, reader_table_baseline,
 		error_1146_reader.blue_writer.endpoint(), RDS_BGD_Probe_Kind::table_check, kProbeTimeoutMs, 0, admin,
@@ -401,10 +442,16 @@ int main() {
 		error_1146_reader_after_reader_rc == EXIT_SUCCESS && error_1146_reader_after_reader == 0 &&
 		server_has_status(admin, error_1146_reader_hgs.blue_reader, error_1146_reader.blue_readers[1], "ONLINE") &&
 		green_rows_remain(admin, error_1146_reader_hgs, error_1146_reader) && drop_after_1146_rc == EXIT_SUCCESS &&
-		error_1146_reader_table_rc == EXIT_SUCCESS && error_1146_reader_metadata.sequence_id < error_1146_reader_table.sequence_id,
+			error_1146_reader_table_rc == EXIT_SUCCESS && error_1146_reader_metadata.sequence_id < error_1146_reader_table.sequence_id,
 		"metadata error 1146 immediately performs reader cleanup, then returns to table checking");
+}
 
-	// A non-absence metadata error must preserve the active phase and its effects.
+/**
+ * Return a generic metadata error during in-progress and verify that it neither
+ * clears the phase nor follows the absent-topology path.
+ */
+void test_generic_metadata_failure(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Enter in-progress, inject a generic direct-metadata failure, and observe the active state.
 	RDS_BGD_Cluster generic_error = bgd_cluster_3_init();
 	BGD_Hostgroups generic_error_hgs { 1160, 1161, 1162, 1163 };
 	vector<Endpoint> generic_error_backends = topology_backends(generic_error);
@@ -413,7 +460,8 @@ int main() {
 	if (bgd_admin_setup(admin, generic_error, generic_error_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ generic_error.blue_writer, generic_error.blue_readers[0], generic_error.blue_readers[1] },
 		{ generic_error.green_writer, generic_error.green_readers[0] }) != EXIT_SUCCESS) BAIL_OUT("failed to configure generic metadata error scenario");
-	rc = enter_in_progress(admin, sim, generic_error, generic_error_hgs, "generic-metadata-error", sequence);
+	uint64_t sequence = 0;
+	int rc = enter_in_progress(admin, sim, generic_error, generic_error_hgs, "generic-metadata-error", sequence);
 	auto [generic_seq_rc, generic_seq] = sim.probe_log_last_sequence();
 	rc = rc == EXIT_SUCCESS && generic_seq_rc == EXIT_SUCCESS ?
 		sim.topology_error({ generic_error.green_writer.endpoint() }, 1105, "simulated generic metadata failure") : EXIT_FAILURE;
@@ -433,6 +481,30 @@ int main() {
 	ok(telemetry_has_kind(sim, generic_seq, generic_error.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata) &&
 		!telemetry_has_kind(sim, generic_seq, generic_error.green_writer.endpoint(), RDS_BGD_Probe_Kind::table_check),
 		"generic metadata failure remains a metadata telemetry path rather than an absent-table path");
+}
+
+}  // namespace
+
+int main() {
+	plan(13);
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_present_empty_before_completion(cl, admin, sim);
+	test_absent_before_completion(cl, admin, sim);
+	test_present_empty_during_reader_switchover(cl, admin, sim);
+	test_absent_during_reader_switchover(cl, admin, sim);
+	test_metadata_1146_before_completion(admin, sim);
+	test_metadata_1146_during_reader_switchover(cl, admin, sim);
+	test_generic_metadata_failure(admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final topology-failure TAP state");

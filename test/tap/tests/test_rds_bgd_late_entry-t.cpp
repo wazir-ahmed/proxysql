@@ -1,6 +1,15 @@
 /**
  * @file test_rds_bgd_late_entry-t.cpp
  * @brief Fresh-worker AWS RDS Blue/Green late-entry characterization coverage.
+ *
+ * Test coverage:
+ * 1. A fresh worker first observes SWITCHOVER_INITIATED.
+ * 2. A fresh worker first observes SWITCHOVER_IN_PROGRESS.
+ * 3. A fresh worker first observes SWITCHOVER_IN_POST_PROCESSING.
+ * 4. A fresh worker first observes target-only SWITCHOVER_COMPLETED.
+ *
+ * Each scenario verifies prerequisite construction, phase effects, repeated
+ * observation behavior, and safe cleanup from that entry point.
  */
 
 #include <cerrno>
@@ -213,23 +222,12 @@ bool green_pools_are_drained(MYSQL* admin, const BGD_Hostgroups& hgs) {
 	return writer_rc == EXIT_SUCCESS && writer == 0 && reader_rc == EXIT_SUCCESS && reader == 0;
 }
 
-}  // namespace
-
-int main() {
-	plan(18);
-
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// A fresh worker first sees SWITCHOVER_INITIATED.
+/**
+ * Start a fresh worker at SWITCHOVER_INITIATED and verify suppression,
+ * repeat stability, and pre-completion cleanup.
+ */
+void test_fresh_initiated_entry(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Publish initiated before creating the worker, then observe its direct entry behavior.
 	RDS_BGD_Cluster initiated = bgd_cluster_init();
 	BGD_Hostgroups initiated_hgs { 1170, 1171, 1172, 1173 };
 	vector<Endpoint> initiated_backends = topology_backends(initiated);
@@ -280,15 +278,21 @@ int main() {
 	ok(rc == EXIT_SUCCESS && initiated_none_rc == EXIT_SUCCESS &&
 		wait_for_precompletion_rollback(admin, sim, initiated_empty_seq, "fresh-initiated", initiated_hgs, initiated) == EXIT_SUCCESS,
 		"fresh initiated present-empty cleanup safely clears suppression and restores baseline placement");
+}
 
-	// A fresh worker first sees SWITCHOVER_IN_PROGRESS.
+/**
+ * Start a fresh worker at SWITCHOVER_IN_PROGRESS and verify immediate
+ * demotion, suppression, repeat stability, and rollback.
+ */
+void test_fresh_in_progress_entry(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Publish in-progress before creating the worker, then observe direct demotion.
 	RDS_BGD_Cluster progress = bgd_cluster_2_init();
 	BGD_Hostgroups progress_hgs { 1180, 1181, 1182, 1183 };
 	vector<Endpoint> progress_backends = topology_backends(progress);
 	if (reset_scenario(admin, sim, progress_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset in-progress late-entry scenario");
 	set_read_only(sim, progress, false, true);
 	auto [progress_publish_seq_rc, progress_publish_seq] = sim.probe_log_last_sequence();
-	rc = progress_publish_seq_rc == EXIT_SUCCESS ?
+	int rc = progress_publish_seq_rc == EXIT_SUCCESS ?
 		sim.topology_update(progress_backends, topology_with_reader_pair(progress, "SWITCHOVER_IN_PROGRESS")) : EXIT_FAILURE;
 	int progress_setup_rc = rc == EXIT_SUCCESS ? bgd_admin_setup(admin, progress, progress_hgs,
 		BGD_Admin_Mode::explicit_configuration,
@@ -332,16 +336,21 @@ int main() {
 	ok(rc == EXIT_SUCCESS && progress_none_rc == EXIT_SUCCESS &&
 		wait_for_precompletion_rollback(admin, sim, progress_empty_seq, "fresh-in-progress", progress_hgs, progress) == EXIT_SUCCESS,
 		"fresh in-progress present-empty cleanup restores the demoted blue writer");
+}
 
-	// A fresh worker first sees SWITCHOVER_IN_POST_PROCESSING.  Create a causal blue pool
-	// only after publishing topology but before the BGD row can start its worker.
+/**
+ * Start a fresh worker at post-processing with a causal blue pool and verify
+ * mapping, draining, suppression, repeat behavior, and rollback.
+ */
+void test_fresh_post_processing_entry(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Publish post-processing and create a blue pool before enabling the BGD worker.
 	RDS_BGD_Cluster post = bgd_cluster_3_init();
 	BGD_Hostgroups post_hgs { 1190, 1191, 1192, 1193 };
 	vector<Endpoint> post_backends = topology_backends(post);
 	if (reset_scenario(admin, sim, post_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset post-processing late-entry scenario");
 	set_read_only(sim, post, false, true);
 	auto [post_publish_seq_rc, post_publish_seq] = sim.probe_log_last_sequence();
-	rc = post_publish_seq_rc == EXIT_SUCCESS ?
+	int rc = post_publish_seq_rc == EXIT_SUCCESS ?
 		sim.topology_update(post_backends, topology_with_reader_pair(post, "SWITCHOVER_IN_POST_PROCESSING")) : EXIT_FAILURE;
 	int post_servers_rc = rc == EXIT_SUCCESS ? configure_servers_without_bgd_worker(admin, post, post_hgs) : EXIT_FAILURE;
 	auto [post_pool_connect_rc, post_pool_echo] = post_servers_rc == EXIT_SUCCESS ? connect_and_echo(cl) : rc_t<string> { EXIT_FAILURE, {} };
@@ -407,16 +416,21 @@ int main() {
 		wait_for_precompletion_rollback(admin, sim, post_empty_seq, "fresh-post-processing", post_hgs, post) == EXIT_SUCCESS &&
 		post_blue_probe_rc == EXIT_SUCCESS,
 		"fresh post-processing present-empty rollback restores readers and removes the temporary blue pin");
+}
 
-	// A fresh worker first sees the target-only completed observation.  It has no prior map
-	// or effects to reconstruct, but reader-phase cleanup still drains configured green pools.
+/**
+ * Start a fresh worker from target-only completion and verify that it does not
+ * reconstruct earlier effects while reader cleanup still drains green pools.
+ */
+void test_fresh_completed_entry(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Publish completion before creating the worker, then verify the inferred reader phase.
 	RDS_BGD_Cluster completed = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups completed_hgs { 1200, 1201, 1202, 1203 };
 	vector<Endpoint> completed_backends = topology_backends(completed);
 	if (reset_scenario(admin, sim, completed_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset completed late-entry scenario");
 	set_read_only(sim, completed, false, true);
 	auto [completed_publish_seq_rc, completed_publish_seq] = sim.probe_log_last_sequence();
-	rc = completed_publish_seq_rc == EXIT_SUCCESS ? sim.topology_update(completed_backends,
+	int rc = completed_publish_seq_rc == EXIT_SUCCESS ? sim.topology_update(completed_backends,
 		target_only_completed(completed)) : EXIT_FAILURE;
 	int completed_setup_rc = rc == EXIT_SUCCESS ? bgd_admin_setup(admin, completed, completed_hgs,
 		BGD_Admin_Mode::explicit_configuration,
@@ -475,6 +489,28 @@ int main() {
 		green_pools_are_drained(admin, completed_hgs) && writer_placement(admin, completed_hgs, completed, true, false) &&
 		server_has_status(admin, completed_hgs.blue_reader, completed.blue_readers[1], "ONLINE"),
 		"fresh completed present-empty cleanup reaches NONE safely and drains configured green pools");
+}
+
+}  // namespace
+
+int main() {
+	plan(18);
+
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_fresh_initiated_entry(admin, sim);
+	test_fresh_in_progress_entry(admin, sim);
+	test_fresh_post_processing_entry(cl, admin, sim);
+	test_fresh_completed_entry(cl, admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final late-entry TAP state");

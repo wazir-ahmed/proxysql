@@ -1,6 +1,12 @@
 /**
  * @file test_rds_bgd_repeat_concurrent-t.cpp
  * @brief Repeated AWS RDS Blue/Green lifecycle and concurrent-worker isolation coverage.
+ *
+ * Test coverage:
+ * 1. Runs two complete deployments through the same hostgroups and verifies
+ *    that the second lifecycle has fresh membership, probes, pools, and effects.
+ * 2. Advances three workers independently, replaces one deployment, and
+ *    verifies that every worker retains its own phase and TLS behavior.
  */
 
 #include <cstdlib>
@@ -280,22 +286,12 @@ bool green_pools_are_zero(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_BGD_Clust
 		reader_rc == EXIT_SUCCESS && reader_count == 0;
 }
 
-}  // namespace
-
-int main() {
-	plan(38);
-
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
+/**
+ * Run two complete deployments through one hostgroup definition and verify
+ * that reset removes every stale probe, pool, membership, and routing effect.
+ */
+void test_repeated_deployment_lifecycle(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure deployment A and execute its full forward lifecycle.
 	const string repeat_scenario = "repeat-deployment";
 	RDS_BGD_Cluster deployment_a = bgd_cluster_init();
 	RDS_BGD_Cluster deployment_b = bgd_cluster_1_deployment_b_init();
@@ -401,6 +397,7 @@ int main() {
 		a_empty_green.sequence_id < a_empty_blue.sequence_id,
 		"deployment A reset removes the green pin and resumes blue metadata probing");
 
+	// Replace green membership with deployment B and execute a fresh second lifecycle.
 	auto [b_available_seq_rc, b_available_seq] = sim.probe_log_last_sequence();
 	rc = b_available_seq_rc == EXIT_SUCCESS ? replace_green_membership(
 		admin, repeat_hgs, deployment_a, deployment_b, 1) : EXIT_FAILURE;
@@ -507,7 +504,14 @@ int main() {
 	ok(green_pools_are_zero(admin, repeat_hgs, deployment_b) &&
 		green_pools_are_zero(admin, repeat_hgs, deployment_a),
 		"deployment B reset drains B pools without recreating deployment A pool state");
+}
 
+/**
+ * Advance three concurrent workers independently, replace cluster 1, and
+ * verify that cluster 2 and cluster 3 keep their own phases and TLS settings.
+ */
+void test_concurrent_worker_isolation(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure all three workers from distinct topology and TLS baselines.
 	const string concurrent_scenario = "concurrent-clusters";
 	RDS_BGD_Cluster cluster_1 = bgd_cluster_init();
 	RDS_BGD_Cluster cluster_1_b = bgd_cluster_1_deployment_b_init();
@@ -531,7 +535,7 @@ int main() {
 	set_role_states(sim, cluster_3);
 
 	auto [concurrent_seq_rc, concurrent_seq] = sim.probe_log_last_sequence();
-	rc = concurrent_seq_rc == EXIT_SUCCESS ? sim.topology_update(
+	int rc = concurrent_seq_rc == EXIT_SUCCESS ? sim.topology_update(
 		topology_backends(cluster_1), topology_with_reader_pair(cluster_1, "AVAILABLE")) : EXIT_FAILURE;
 	if (rc == EXIT_SUCCESS) rc = sim.topology_update(
 		topology_backends(cluster_2), topology_with_reader_pair(cluster_2, "AVAILABLE"));
@@ -586,12 +590,13 @@ int main() {
 		cluster_3_status_rc == EXIT_SUCCESS,
 		"concurrent cluster 3 records AVAILABLE from its own green backend");
 
+	// Advance each worker to a different phase and verify the others remain unchanged.
 	auto [cluster_1_progress_seq_rc, cluster_1_progress_seq] = sim.probe_log_last_sequence();
 	rc = cluster_1_progress_seq_rc == EXIT_SUCCESS ? sim.topology_update(
 		topology_backends(cluster_1), topology_with_reader_pair(cluster_1, "SWITCHOVER_IN_PROGRESS")) : EXIT_FAILURE;
-	phase_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, cluster_1_progress_seq,
+	int phase_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, cluster_1_progress_seq,
 		concurrent_scenario, cluster_1_hgs, "cluster 1 in progress", "WRITER_SWITCHOVER_IN_PROGRESS") : EXIT_FAILURE;
-	effects_rc = phase_rc == EXIT_SUCCESS ? wait_for_writer_placement(admin, sim, cluster_1_progress_seq,
+	int effects_rc = phase_rc == EXIT_SUCCESS ? wait_for_writer_placement(admin, sim, cluster_1_progress_seq,
 		concurrent_scenario, cluster_1_hgs, cluster_1, "cluster 1 in-progress effects", true) : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && phase_rc == EXIT_SUCCESS && effects_rc == EXIT_SUCCESS,
 		"advancing cluster 1 alone applies only its in-progress writer demotion");
@@ -628,6 +633,7 @@ int main() {
 		post_effects(admin, cluster_2_hgs, cluster_2),
 		"cluster 3 advancement preserves cluster 1 progress and cluster 2 post-processing");
 
+	// Replace cluster 1 and verify all three workers are reprobed without phase leakage.
 	auto [cluster_1_replace_seq_rc, cluster_1_replace_seq] = sim.probe_log_last_sequence();
 	rc = cluster_1_replace_seq_rc == EXIT_SUCCESS ? replace_green_membership(
 		admin, cluster_1_hgs, cluster_1, cluster_1_b, 1) : EXIT_FAILURE;
@@ -682,6 +688,26 @@ int main() {
 		status_is(admin, cluster_3_hgs, "WRITER_SWITCHOVER_INITIATED") &&
 		writer_placement(admin, cluster_3_hgs, cluster_3, false),
 		"cluster 1 replacement reprobes cluster 3 and preserves its initiated phase");
+}
+
+}  // namespace
+
+int main() {
+	plan(38);
+
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_repeated_deployment_lifecycle(cl, admin, sim);
+	test_concurrent_worker_isolation(admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final repeated/concurrent TAP state");

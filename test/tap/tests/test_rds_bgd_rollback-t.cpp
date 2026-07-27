@@ -1,6 +1,13 @@
 /**
  * @file test_rds_bgd_rollback-t.cpp
  * @brief Accepted AWS RDS Blue/Green cancellation and rollback coverage.
+ *
+ * Test coverage:
+ * 1. Cancels from SWITCHOVER_INITIATED and restores blue placement while
+ *    retaining a monitor-created green writer.
+ * 2. Cancels from SWITCHOVER_IN_PROGRESS and preserves administrator-owned
+ *    green rows and their existing connection pools.
+ * 3. Repeats the returned AVAILABLE observation to verify idempotent rollback.
  */
 
 #include <cstdlib>
@@ -131,21 +138,12 @@ bool green_snapshots_unchanged(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_BGD_
 		(runtime_reader.empty() || snapshot_unchanged(admin, "runtime_mysql_servers", hgs.green_reader, cluster.green_readers[0], runtime_reader));
 }
 
-} // namespace
-
-int main() {
-	plan(13);
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin); BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// Accepted initiated cancellation: monitor creates this target server in an initially empty configured green HG.
+/**
+ * Cancel an initiated switchover whose green writer was created in runtime by
+ * the monitor, then verify placement restoration and repeat stability.
+ */
+void test_initiated_cancellation(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Reach AVAILABLE with an empty configured green hostgroup and snapshot its created target.
 	RDS_BGD_Cluster created = bgd_cluster_init();
 	BGD_Hostgroups created_hgs { 980, 981, 982, 983 };
 	vector<Endpoint> created_backends = topology_backends(created);
@@ -169,6 +167,7 @@ int main() {
 		created_runtime_rc == EXIT_SUCCESS && created_admin.empty() && created_runtime.size() == 1,
 		"AVAILABLE monitor creates the exact target green writer in runtime while Admin remains unchanged");
 
+	// Enter initiated, then return to AVAILABLE and verify full blue rollback.
 	auto [initiated_seq_rc, initiated_seq] = sim.probe_log_last_sequence();
 	rc = initiated_seq_rc == EXIT_SUCCESS ? sim.topology_update(created_backends, topology_with_reader_pair(created, "SWITCHOVER_INITIATED")) : EXIT_FAILURE;
 	int initiated_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, initiated_seq, "initiated-cancel", created_hgs, "initiated", "WRITER_SWITCHOVER_INITIATED") : EXIT_FAILURE;
@@ -191,6 +190,7 @@ int main() {
 		created.blue_readers[0], created_read_only_baseline) : EXIT_FAILURE;
 	ok(unsuppressed_rc == EXIT_SUCCESS, "initiated rollback clears read_only suppression for a discriminating reader action");
 
+	// Repeat AVAILABLE to verify that rollback effects and the created target remain stable.
 	auto [created_repeat_seq_rc, created_repeat_seq] = sim.probe_log_last_sequence();
 	rc = created_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(created_backends, topology_with_reader_pair(created, "AVAILABLE")) : EXIT_FAILURE;
 	int created_repeat_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, created_repeat_seq, "initiated-cancel", created_hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
@@ -201,8 +201,14 @@ int main() {
 	ok(rc == EXIT_SUCCESS && created_repeat_rc == EXIT_SUCCESS && created_repeat_placement_rc == EXIT_SUCCESS && created_repeat_probe_rc == EXIT_SUCCESS &&
 		green_snapshots_unchanged(admin, created_hgs, created, created_admin, created_runtime),
 		"repeated returned AVAILABLE preserves full placement, probe target, and monitor-created green row");
+}
 
-	// Accepted cancellation from SWITCHOVER_IN_PROGRESS: explicit green membership and its pools are not rollback-owned.
+/**
+ * Cancel after blue-writer demotion and verify that explicit green membership
+ * and pre-existing green pools remain administrator-owned.
+ */
+void test_in_progress_cancellation(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Reach AVAILABLE with explicit green rows and establish both green pools.
 	RDS_BGD_Cluster explicit_cluster = bgd_cluster_2_init();
 	BGD_Hostgroups explicit_hgs { 990, 991, 992, 993 };
 	vector<Endpoint> explicit_backends = topology_backends(explicit_cluster);
@@ -212,7 +218,7 @@ int main() {
 	set_read_only(sim, explicit_cluster.blue_readers[0], true);
 	set_read_only(sim, explicit_cluster.blue_readers[1], true);
 	auto [explicit_available_seq_rc, explicit_available_seq] = sim.probe_log_last_sequence();
-	rc = explicit_available_seq_rc == EXIT_SUCCESS ? sim.topology_update(explicit_backends, topology_with_reader_pair(explicit_cluster, "AVAILABLE")) : EXIT_FAILURE;
+	int rc = explicit_available_seq_rc == EXIT_SUCCESS ? sim.topology_update(explicit_backends, topology_with_reader_pair(explicit_cluster, "AVAILABLE")) : EXIT_FAILURE;
 	int explicit_setup_rc = rc == EXIT_SUCCESS ? bgd_admin_setup(admin, explicit_cluster, explicit_hgs, BGD_Admin_Mode::explicit_configuration,
 		{ explicit_cluster.blue_writer, explicit_cluster.blue_readers[0], explicit_cluster.blue_readers[1] },
 		{ explicit_cluster.green_writer, explicit_cluster.green_readers[0] }) : EXIT_FAILURE;
@@ -234,6 +240,7 @@ int main() {
 	ok(green_pool_setup_rc == EXIT_SUCCESS && green_writer_pool_rc == EXIT_SUCCESS && green_writer_pool >= 1 &&
 		green_reader_pool_rc == EXIT_SUCCESS && green_reader_pool >= 1, "green pools exist before in-progress cancellation");
 
+	// Advance through initiated and in-progress until the blue writer is demoted.
 	auto [explicit_initiated_seq_rc, explicit_initiated_seq] = sim.probe_log_last_sequence();
 	rc = explicit_initiated_seq_rc == EXIT_SUCCESS ? sim.topology_update(explicit_backends, topology_with_reader_pair(explicit_cluster, "SWITCHOVER_INITIATED")) : EXIT_FAILURE;
 	int explicit_initiated_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, explicit_initiated_seq, "in-progress-cancel", explicit_hgs, "initiated", "WRITER_SWITCHOVER_INITIATED") : EXIT_FAILURE;
@@ -245,6 +252,7 @@ int main() {
 	int demoted_rc = progress_rc == EXIT_SUCCESS ? wait_for_placement(admin, sim, progress_seq, "in-progress-cancel", explicit_hgs, explicit_cluster, "writer demotion", true) : EXIT_FAILURE;
 	ok(rc == EXIT_SUCCESS && progress_rc == EXIT_SUCCESS && demoted_rc == EXIT_SUCCESS, "in-progress cancellation is entered only after blue writer demotion");
 
+	// Return to AVAILABLE and verify blue restoration without mutating green ownership.
 	auto [explicit_return_seq_rc, explicit_return_seq] = sim.probe_log_last_sequence();
 	rc = explicit_return_seq_rc == EXIT_SUCCESS ? sim.topology_update(explicit_backends, topology_with_reader_pair(explicit_cluster, "AVAILABLE")) : EXIT_FAILURE;
 	int explicit_returned_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, explicit_return_seq, "in-progress-cancel", explicit_hgs, "returned available", "AVAILABLE") : EXIT_FAILURE;
@@ -266,6 +274,7 @@ int main() {
 	ok(blue_echo_rc == EXIT_SUCCESS && blue_echo.find(explicit_cluster.blue_writer.ip) != string::npos,
 		"returned AVAILABLE routes a new blue-writer connection to the blue backend IP");
 
+	// Repeat AVAILABLE to confirm placement, probe routing, rows, and pools are stable.
 	auto [explicit_repeat_seq_rc, explicit_repeat_seq] = sim.probe_log_last_sequence();
 	rc = explicit_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(explicit_backends, topology_with_reader_pair(explicit_cluster, "AVAILABLE")) : EXIT_FAILURE;
 	int explicit_repeat_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, explicit_repeat_seq, "in-progress-cancel", explicit_hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
@@ -280,6 +289,24 @@ int main() {
 		repeat_reader_pool >= green_reader_pool && green_snapshots_unchanged(admin, explicit_hgs, explicit_cluster,
 			explicit_admin_writer, explicit_runtime_writer, explicit_admin_reader, explicit_runtime_reader),
 		"repeated returned AVAILABLE preserves placement, probe routing, green rows, and green pools");
+}
+
+} // namespace
+
+int main() {
+	plan(13);
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin); BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_initiated_cancellation(admin, sim);
+	test_in_progress_cancellation(cl, admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final rollback TAP state");

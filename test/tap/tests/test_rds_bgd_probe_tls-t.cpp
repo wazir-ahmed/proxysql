@@ -1,6 +1,14 @@
 /**
  * @file test_rds_bgd_probe_tls-t.cpp
  * @brief AWS RDS Blue/Green direct-probe tuple and TLS coverage.
+ *
+ * Test coverage:
+ * 1. Automatic discovery inherits TLS from the matched blue writer.
+ * 2. Explicit configuration selects the exact recorded target and its TLS,
+ *    ignoring another valid-looking green-writer row.
+ * 3. A monitor-created target inherits TLS from hostgroup server defaults.
+ *
+ * Every scenario also verifies probe ordering and unchanged blue client routing.
  */
 
 #include <cstdlib>
@@ -126,24 +134,12 @@ bool green_default_is_tls(MYSQL* admin, int hostgroup) {
 	return rc == EXIT_SUCCESS && rows.size() == 1 && rows[0].size() == 1 && rows[0][0] == "1";
 }
 
-}  // namespace
-
-int main() {
-	plan(15);
-
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// Automatic mode takes direct-probe TLS from the matched blue writer.
+/**
+ * Configure a plaintext reader and TLS writer in automatic mode, then verify
+ * that direct probing uses the matched writer's TLS property.
+ */
+void test_automatic_writer_tls(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Load distinct reader and writer TLS values before publishing AVAILABLE.
 	RDS_BGD_Cluster automatic = bgd_cluster_init();
 	BGD_Hostgroups automatic_hgs { 940, 941, 942, 943 };
 	if (scenario_cleanup(admin, sim, cluster_backends(automatic)) != EXIT_SUCCESS) {
@@ -176,8 +172,14 @@ int main() {
 		"automatic: direct metadata probe targets the mapped green writer IP and inherits matched blue-writer TLS");
 	ok(blue_backend_and_pool_match(cl, admin, automatic, automatic_hgs),
 		"automatic: client backend and connection pool remain on the configured blue writer");
+}
 
-	// Explicit mode: a valid-looking distractor is present, but only the exact TARGET may supply TLS.
+/**
+ * Place an exact TLS target beside a plaintext distractor and verify that the
+ * recorded target identity supplies the direct-probe tuple.
+ */
+void test_explicit_target_tls_selection(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure both candidate rows with distinguishable TLS values.
 	RDS_BGD_Cluster explicit_cluster = bgd_cluster_2_init();
 	RDS_BGD_Cluster distractor_cluster = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups explicit_hgs { 950, 951, 952, 953 };
@@ -206,7 +208,7 @@ int main() {
 		"explicit: valid-looking distractor and exact TARGET rows have distinct runtime/Admin TLS values");
 	auto [explicit_seq_rc, explicit_seq] = sim.probe_log_last_sequence();
 	if (explicit_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read explicit direct-probe baseline");
-	rc = sim.topology_update(explicit_cluster.get_writers(), explicit_cluster.get_topology("AVAILABLE"));
+	int rc = sim.topology_update(explicit_cluster.get_writers(), explicit_cluster.get_topology("AVAILABLE"));
 	int explicit_available_rc = rc == EXIT_SUCCESS ? wait_for_available(admin, sim, explicit_seq,
 		"explicit-target-identity", explicit_hgs) : EXIT_FAILURE;
 	auto explicit_chain = wait_for_direct_probe_chain(admin, sim, explicit_seq, explicit_cluster, explicit_hgs, 0, 1,
@@ -222,8 +224,14 @@ int main() {
 		"explicit: direct metadata probe selects the exact TARGET hostname rather than the TLS distractor");
 	ok(blue_backend_and_pool_match(cl, admin, explicit_cluster, explicit_hgs),
 		"explicit: client backend and connection pool remain on the configured blue writer");
+}
 
-	// An empty explicit green writer hostgroup gets its TLS from servers_defaults when BGD creates TARGET.
+/**
+ * Leave the explicit green writer hostgroup empty and verify that the
+ * monitor-created target applies its configured server TLS defaults.
+ */
+void test_created_target_tls_defaults(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure TLS defaults without pre-creating a target server row.
 	RDS_BGD_Cluster defaults_cluster = bgd_cluster_3_init();
 	BGD_Hostgroups defaults_hgs { 960, 961, 962, 963 };
 	if (scenario_cleanup(admin, sim, cluster_backends(defaults_cluster)) != EXIT_SUCCESS) {
@@ -243,7 +251,7 @@ int main() {
 		"defaults-created: explicit green writer hostgroup starts empty with persistent TLS defaults");
 	auto [defaults_seq_rc, defaults_seq] = sim.probe_log_last_sequence();
 	if (defaults_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read defaults-created direct-probe baseline");
-	rc = sim.topology_update(defaults_cluster.get_writers(), defaults_cluster.get_topology("AVAILABLE"));
+	int rc = sim.topology_update(defaults_cluster.get_writers(), defaults_cluster.get_topology("AVAILABLE"));
 	int defaults_available_rc = rc == EXIT_SUCCESS ? wait_for_available(admin, sim, defaults_seq,
 		"defaults-created-target", defaults_hgs) : EXIT_FAILURE;
 	int defaults_server_rc = defaults_available_rc == EXIT_SUCCESS ? bgd_wait_for_condition(admin,
@@ -265,6 +273,28 @@ int main() {
 		"defaults-created: direct TARGET metadata probe uses TLS after runtime row creation");
 	ok(blue_backend_and_pool_match(cl, admin, defaults_cluster, defaults_hgs),
 		"defaults-created: client backend and connection pool remain on the configured blue writer");
+}
+
+}  // namespace
+
+int main() {
+	plan(15);
+
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_automatic_writer_tls(cl, admin, sim);
+	test_explicit_target_tls_selection(cl, admin, sim);
+	test_created_target_tls_defaults(cl, admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final probe/TLS TAP state");

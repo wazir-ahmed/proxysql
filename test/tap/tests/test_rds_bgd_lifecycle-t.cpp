@@ -1,6 +1,16 @@
 /**
  * @file test_rds_bgd_lifecycle-t.cpp
  * @brief Normal AWS RDS Blue/Green forward lifecycle coverage.
+ *
+ * Test flow:
+ * 1. AVAILABLE establishes blue routing plus eligible green pools.
+ * 2. SWITCHOVER_INITIATED suppresses deployment-member placement changes.
+ * 3. SWITCHOVER_IN_PROGRESS demotes the mapped blue writer.
+ * 4. SWITCHOVER_IN_POST_PROCESSING restores mapped placement and drains pools.
+ * 5. Writer completion defers green cleanup until the reader signal.
+ * 6. Empty topology completes cleanup, resumes blue probing, and reaches NONE.
+ *
+ * Repeated observations in every phase verify idempotent public behavior.
  */
 
 #include <cstdlib>
@@ -179,6 +189,318 @@ bool green_rows_remain_online(MYSQL* admin, const BGD_Hostgroups& hgs, RDS_BGD_C
 		server_has_status(admin, hgs.green_reader, cluster.green_readers[0], "ONLINE");
 }
 
+struct Lifecycle_Context {
+	const CommandLine& cl;
+	MYSQL* admin;
+	RDS_BGD_Simulator& sim;
+	RDS_BGD_Cluster cluster;
+	BGD_Hostgroups hgs;
+	vector<Endpoint> backends;
+
+	Lifecycle_Context(const CommandLine& cl_, MYSQL* admin_, RDS_BGD_Simulator& sim_)
+		: cl(cl_), admin(admin_), sim(sim_), cluster(bgd_cluster_init()),
+		  hgs { 970, 971, 972, 973 }, backends(topology_backends(cluster)) {}
+};
+
+/**
+ * Establish AVAILABLE state, create blue and green pools, and verify that a
+ * repeated observation leaves writer placement unchanged.
+ */
+void test_available_phase(Lifecycle_Context& ctx) {
+	// Publish AVAILABLE and wait for the worker's public runtime state.
+	auto [available_seq_rc, available_seq] = ctx.sim.probe_log_last_sequence();
+	if (available_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read AVAILABLE probe baseline");
+	int rc = ctx.sim.topology_update(ctx.backends, topology_with_one_reader_pair(ctx.cluster, "AVAILABLE"));
+	int available_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(ctx.admin, ctx.sim, available_seq, ctx.hgs, "available", "AVAILABLE") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && available_rc == EXIT_SUCCESS,
+		"recorded AVAILABLE observation enters AVAILABLE runtime status");
+
+	// Establish pools in every eligible hostgroup before lifecycle effects begin.
+	int blue_connect_rc = connect_and_echo(ctx.cl).first;
+	int green_writer_pool_rc = set_default_hostgroup(ctx.admin, ctx.hgs.green_writer) == EXIT_SUCCESS ?
+		connect_and_echo(ctx.cl).first : EXIT_FAILURE;
+	int green_reader_pool_rc = set_default_hostgroup(ctx.admin, ctx.hgs.green_reader) == EXIT_SUCCESS ?
+		connect_and_echo(ctx.cl).first : EXIT_FAILURE;
+	int restore_blue_rc = set_default_hostgroup(ctx.admin, ctx.hgs.blue_writer);
+	auto [blue_pool_count_rc, blue_pool] =
+		bgd_connection_pool_count(ctx.admin, ctx.hgs.blue_writer, ctx.cluster.blue_writer.hostname);
+	auto [green_writer_pool_count_rc, green_writer_pool] =
+		bgd_connection_pool_count(ctx.admin, ctx.hgs.green_writer);
+	auto [green_reader_pool_count_rc, green_reader_pool] =
+		bgd_connection_pool_count(ctx.admin, ctx.hgs.green_reader);
+	ok(blue_connect_rc == EXIT_SUCCESS && blue_pool_count_rc == EXIT_SUCCESS && blue_pool >= 1 &&
+		green_writer_pool_rc == EXIT_SUCCESS && green_writer_pool_count_rc == EXIT_SUCCESS && green_writer_pool >= 1 &&
+		green_reader_pool_rc == EXIT_SUCCESS && green_reader_pool_count_rc == EXIT_SUCCESS && green_reader_pool >= 1 &&
+		restore_blue_rc == EXIT_SUCCESS,
+		"AVAILABLE establishes blue and eligible green connection pools before lifecycle effects");
+
+	// Repeat AVAILABLE to prove the phase is idempotent.
+	auto [available_repeat_seq_rc, available_repeat_seq] = ctx.sim.probe_log_last_sequence();
+	rc = available_repeat_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends, topology_with_one_reader_pair(ctx.cluster, "AVAILABLE")) : EXIT_FAILURE;
+	int available_repeat_rc = rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, available_repeat_seq, ctx.cluster, ctx.hgs, "available repeat") : EXIT_FAILURE;
+	int available_repeat_status_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(ctx.admin, ctx.sim, available_repeat_seq, ctx.hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && available_repeat_rc == EXIT_SUCCESS && available_repeat_status_rc == EXIT_SUCCESS &&
+		writer_in_expected_placement(ctx.admin, ctx.hgs, ctx.cluster, true, false),
+		"repeated AVAILABLE observation preserves status and writer placement");
+}
+
+/**
+ * Enter SWITCHOVER_INITIATED and verify that read-only changes for deployment
+ * members remain suppressed across a repeated observation.
+ */
+int64_t test_switchover_initiated_phase(Lifecycle_Context& ctx) {
+	// Publish initiated and wait for the corresponding public runtime state.
+	auto [initiated_seq_rc, initiated_seq] = ctx.sim.probe_log_last_sequence();
+	int rc = initiated_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends, topology_with_one_reader_pair(ctx.cluster, "SWITCHOVER_INITIATED")) :
+		EXIT_FAILURE;
+	int initiated_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(ctx.admin, ctx.sim, initiated_seq, ctx.hgs, "initiated", "WRITER_SWITCHOVER_INITIATED") :
+		EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && initiated_rc == EXIT_SUCCESS,
+		"recorded SWITCHOVER_INITIATED observation enters initiated runtime status");
+
+	// Flip simulated roles and verify that suppression prevents placement actions.
+	int64_t initiated_writer_log = last_read_only_log_time(ctx.admin, ctx.cluster.blue_writer);
+	int64_t initiated_reader_log = last_read_only_log_time(ctx.admin, ctx.cluster.blue_readers[0]);
+	set_read_only(ctx.sim, ctx.cluster.blue_writer, true);
+	set_read_only(ctx.sim, ctx.cluster.blue_readers[0], false);
+	auto [initiated_suppression_seq_rc, initiated_suppression_seq] = ctx.sim.probe_log_last_sequence();
+	int initiated_suppression_rc = initiated_suppression_seq_rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, initiated_suppression_seq, ctx.cluster, ctx.hgs,
+			"initiated suppression") : EXIT_FAILURE;
+	ok(initiated_suppression_rc == EXIT_SUCCESS &&
+		writer_in_expected_placement(ctx.admin, ctx.hgs, ctx.cluster, true, false) &&
+		server_has_status(ctx.admin, ctx.hgs.blue_reader, ctx.cluster.blue_readers[0], "ONLINE") &&
+		server_absent(ctx.admin, ctx.hgs.blue_writer, ctx.cluster.blue_readers[0]) &&
+		no_read_only_log_after(ctx.admin, ctx.cluster.blue_writer, initiated_writer_log) &&
+		no_read_only_log_after(ctx.admin, ctx.cluster.blue_readers[0], initiated_reader_log),
+		"initiated suppresses read-only placement changes for deployment members");
+
+	// Repeat initiated to verify stable status and suppressed placement.
+	auto [initiated_repeat_seq_rc, initiated_repeat_seq] = ctx.sim.probe_log_last_sequence();
+	rc = initiated_repeat_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends, topology_with_one_reader_pair(ctx.cluster, "SWITCHOVER_INITIATED")) :
+		EXIT_FAILURE;
+	int initiated_repeat_rc = rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, initiated_repeat_seq, ctx.cluster, ctx.hgs, "initiated repeat") :
+		EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && initiated_repeat_rc == EXIT_SUCCESS &&
+		wait_for_status(ctx.admin, ctx.sim, initiated_repeat_seq, ctx.hgs, "initiated repeat",
+			"WRITER_SWITCHOVER_INITIATED") == EXIT_SUCCESS &&
+		writer_in_expected_placement(ctx.admin, ctx.hgs, ctx.cluster, true, false),
+		"repeated initiated observation preserves status and suppressed placement");
+
+	return initiated_reader_log;
+}
+
+/**
+ * Enter SWITCHOVER_IN_PROGRESS, verify mapped-writer demotion and continued
+ * reader suppression, then repeat the observation.
+ */
+void test_switchover_in_progress_phase(Lifecycle_Context& ctx, int64_t initiated_reader_log) {
+	// Publish in-progress and wait for mapped writer demotion.
+	auto [progress_seq_rc, progress_seq] = ctx.sim.probe_log_last_sequence();
+	int rc = progress_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends, topology_with_one_reader_pair(ctx.cluster, "SWITCHOVER_IN_PROGRESS")) :
+		EXIT_FAILURE;
+	int progress_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(ctx.admin, ctx.sim, progress_seq, ctx.hgs, "in progress",
+			"WRITER_SWITCHOVER_IN_PROGRESS") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && progress_rc == EXIT_SUCCESS,
+		"recorded SWITCHOVER_IN_PROGRESS observation enters in-progress runtime status");
+
+	int progress_effects_rc = progress_rc == EXIT_SUCCESS ?
+		wait_for_in_progress_effects(ctx.admin, ctx.sim, progress_seq, ctx.cluster, ctx.hgs) : EXIT_FAILURE;
+	ok(progress_effects_rc == EXIT_SUCCESS,
+		"in-progress policy demotes the mapped blue writer while suppression keeps the blue reader placed");
+
+	// Verify the pending reader promotion remains suppressed.
+	auto [progress_suppression_seq_rc, progress_suppression_seq] = ctx.sim.probe_log_last_sequence();
+	int progress_suppression_rc = progress_suppression_seq_rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, progress_suppression_seq, ctx.cluster, ctx.hgs,
+			"in-progress suppression") : EXIT_FAILURE;
+	ok(progress_suppression_rc == EXIT_SUCCESS &&
+		server_has_status(ctx.admin, ctx.hgs.blue_reader, ctx.cluster.blue_readers[0], "ONLINE") &&
+		server_absent(ctx.admin, ctx.hgs.blue_writer, ctx.cluster.blue_readers[0]) &&
+		no_read_only_log_after(ctx.admin, ctx.cluster.blue_readers[0], initiated_reader_log),
+		"in-progress continues to suppress the pending read-only promotion");
+
+	// Repeat in-progress to verify the demoted placement remains stable.
+	auto [progress_repeat_seq_rc, progress_repeat_seq] = ctx.sim.probe_log_last_sequence();
+	rc = progress_repeat_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends, topology_with_one_reader_pair(ctx.cluster, "SWITCHOVER_IN_PROGRESS")) :
+		EXIT_FAILURE;
+	int progress_repeat_rc = rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, progress_repeat_seq, ctx.cluster, ctx.hgs, "in-progress repeat") :
+		EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && progress_repeat_rc == EXIT_SUCCESS &&
+		wait_for_status(ctx.admin, ctx.sim, progress_repeat_seq, ctx.hgs, "in-progress repeat",
+			"WRITER_SWITCHOVER_IN_PROGRESS") == EXIT_SUCCESS &&
+		writer_in_expected_placement(ctx.admin, ctx.hgs, ctx.cluster, false, true),
+		"repeated in-progress observation preserves status and blue-writer demotion");
+}
+
+/**
+ * Enter post-processing, verify mapped placement and pool draining, then prove
+ * that suppression and placement remain stable on repeat.
+ */
+void test_post_processing_phase(Lifecycle_Context& ctx, int64_t initiated_reader_log) {
+	// Publish post-processing and wait for mapped runtime placement.
+	auto [post_seq_rc, post_seq] = ctx.sim.probe_log_last_sequence();
+	int rc = post_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends,
+			topology_with_one_reader_pair(ctx.cluster, "SWITCHOVER_IN_POST_PROCESSING")) : EXIT_FAILURE;
+	int post_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(ctx.admin, ctx.sim, post_seq, ctx.hgs, "post processing",
+			"WRITER_SWITCHOVER_POST_PROCESSING") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && post_rc == EXIT_SUCCESS,
+		"recorded SWITCHOVER_IN_POST_PROCESSING observation enters post-processing runtime status");
+
+	int post_runtime_effects_rc = post_rc == EXIT_SUCCESS ?
+		wait_for_post_runtime_effects(ctx.admin, ctx.sim, post_seq, ctx.cluster, ctx.hgs) : EXIT_FAILURE;
+	ok(post_runtime_effects_rc == EXIT_SUCCESS,
+		"post-processing restores writer placement and retains the mapped reader");
+
+	// Drain the old blue-writer pool and verify new blue-hostgroup traffic reaches green.
+	int post_pool_drain_rc = post_runtime_effects_rc == EXIT_SUCCESS ?
+		wait_for_blue_writer_pool_drain(ctx.admin, ctx.sim, post_seq, ctx.cluster, ctx.hgs) : EXIT_FAILURE;
+	ok(post_pool_drain_rc == EXIT_SUCCESS,
+		"post-processing drains existing pools for the mapped blue writer hostname");
+
+	auto [post_echo_rc, post_echo] = connect_and_echo(ctx.cl);
+	ok(post_echo_rc == EXIT_SUCCESS && post_echo.find(ctx.cluster.green_writer.ip) != string::npos,
+		"post-processing pins a new mapped-blue writer connection to the green backend IP");
+
+	// Verify the mapped reader remains suppressed and repeat the phase.
+	auto [post_suppression_seq_rc, post_suppression_seq] = ctx.sim.probe_log_last_sequence();
+	int post_suppression_rc = post_suppression_seq_rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, post_suppression_seq, ctx.cluster, ctx.hgs,
+			"post-processing suppression") : EXIT_FAILURE;
+	ok(post_suppression_rc == EXIT_SUCCESS &&
+		server_has_status(ctx.admin, ctx.hgs.blue_reader, ctx.cluster.blue_readers[0], "ONLINE") &&
+		server_absent(ctx.admin, ctx.hgs.blue_writer, ctx.cluster.blue_readers[0]) &&
+		no_read_only_log_after(ctx.admin, ctx.cluster.blue_readers[0], initiated_reader_log),
+		"post-processing continues to suppress read-only placement changes for the mapped reader");
+
+	auto [post_repeat_seq_rc, post_repeat_seq] = ctx.sim.probe_log_last_sequence();
+	rc = post_repeat_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends,
+			topology_with_one_reader_pair(ctx.cluster, "SWITCHOVER_IN_POST_PROCESSING")) : EXIT_FAILURE;
+	int post_repeat_rc = rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, post_repeat_seq, ctx.cluster, ctx.hgs, "post-processing repeat") :
+		EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && post_repeat_rc == EXIT_SUCCESS &&
+		wait_for_status(ctx.admin, ctx.sim, post_repeat_seq, ctx.hgs, "post-processing repeat",
+			"WRITER_SWITCHOVER_POST_PROCESSING") == EXIT_SUCCESS &&
+		writer_in_expected_placement(ctx.admin, ctx.hgs, ctx.cluster, true, false) &&
+		server_has_status(ctx.admin, ctx.hgs.blue_reader, ctx.cluster.blue_readers[0], "ONLINE"),
+		"repeated post-processing observation preserves status and mapped placement");
+}
+
+/**
+ * Infer reader switchover from target-only completion, then process empty
+ * topology and verify final probe, pool, and configured-row behavior.
+ */
+void test_reader_completion_phase(Lifecycle_Context& ctx) {
+	// Publish target-only completion and defer green cleanup during reader switchover.
+	auto [completed_seq_rc, completed_seq] = ctx.sim.probe_log_last_sequence();
+	int rc = completed_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends, target_only_completed(ctx.cluster)) : EXIT_FAILURE;
+	int completed_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(ctx.admin, ctx.sim, completed_seq, ctx.hgs, "target-only completed",
+			"READER_SWITCHOVER_IN_PROGRESS") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && completed_rc == EXIT_SUCCESS,
+		"target-only SWITCHOVER_COMPLETED observation enters inferred reader-switchover status");
+
+	ok(green_rows_remain_online(ctx.admin, ctx.hgs, ctx.cluster),
+		"writer completion defers green-row cleanup until the reader signal");
+
+	auto [completed_repeat_seq_rc, completed_repeat_seq] = ctx.sim.probe_log_last_sequence();
+	rc = completed_repeat_seq_rc == EXIT_SUCCESS ?
+		ctx.sim.topology_update(ctx.backends, target_only_completed(ctx.cluster)) : EXIT_FAILURE;
+	int completed_repeat_rc = rc == EXIT_SUCCESS ?
+		wait_for_observation(ctx.admin, ctx.sim, completed_repeat_seq, ctx.cluster, ctx.hgs,
+			"target-only completed repeat") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && completed_repeat_rc == EXIT_SUCCESS &&
+		wait_for_status(ctx.admin, ctx.sim, completed_repeat_seq, ctx.hgs, "target-only completed repeat",
+			"READER_SWITCHOVER_IN_PROGRESS") == EXIT_SUCCESS &&
+		green_rows_remain_online(ctx.admin, ctx.hgs, ctx.cluster),
+		"repeated target-only completed observation preserves reader-switchover phase and green rows");
+
+	// Delete all topology rows to complete reader cleanup and resume blue probing.
+	auto [empty_seq_rc, empty_seq] = ctx.sim.probe_log_last_sequence();
+	rc = empty_seq_rc == EXIT_SUCCESS ? ctx.sim.topology_delete(ctx.backends) : EXIT_FAILURE;
+	int empty_rc = rc == EXIT_SUCCESS ?
+		wait_for_status(ctx.admin, ctx.sim, empty_seq, ctx.hgs, "present empty", "NONE") : EXIT_FAILURE;
+	ok(rc == EXIT_SUCCESS && empty_rc == EXIT_SUCCESS,
+		"present-but-empty topology completes reader cleanup and reaches NONE");
+
+	ok(server_has_status(ctx.admin, ctx.hgs.blue_reader, ctx.cluster.blue_readers[1], "ONLINE"),
+		"final cleanup restores the unmatched blue reader to ONLINE");
+
+	auto [empty_green_rc, empty_green_probe] = bgd_wait_for_probe(ctx.sim, empty_seq,
+		ctx.cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, ctx.admin,
+		kScenario, "present-empty green observation", ctx.hgs.blue_writer,
+		{ ctx.hgs.blue_writer, ctx.hgs.blue_reader, ctx.hgs.green_writer, ctx.hgs.green_reader });
+	const uint64_t blue_probe_baseline = empty_green_rc == EXIT_SUCCESS ? empty_green_probe.sequence_id : empty_seq;
+	auto [blue_after_empty_rc, blue_after_empty_probe] = bgd_wait_for_probe(ctx.sim, blue_probe_baseline,
+		ctx.cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, ctx.admin, kScenario,
+		"post-cleanup blue probe", ctx.hgs.blue_writer,
+		{ ctx.hgs.blue_writer, ctx.hgs.blue_reader, ctx.hgs.green_writer, ctx.hgs.green_reader });
+	ok(empty_green_rc == EXIT_SUCCESS && blue_after_empty_rc == EXIT_SUCCESS &&
+		empty_green_probe.sequence_id < blue_after_empty_probe.sequence_id,
+		"final cleanup removes the direct green probe pin and resumes blue-IP metadata probing");
+
+	// Verify cleanup drains green pools without deleting configured green rows.
+	auto [final_green_writer_pool_rc, final_green_writer_pool] =
+		bgd_connection_pool_count(ctx.admin, ctx.hgs.green_writer);
+	auto [final_green_reader_pool_rc, final_green_reader_pool] =
+		bgd_connection_pool_count(ctx.admin, ctx.hgs.green_reader);
+	ok(final_green_writer_pool_rc == EXIT_SUCCESS && final_green_writer_pool == 0 &&
+		final_green_reader_pool_rc == EXIT_SUCCESS && final_green_reader_pool == 0,
+		"final cleanup drains eligible green hostgroup pools");
+
+	ok(green_rows_remain_online(ctx.admin, ctx.hgs, ctx.cluster),
+		"final cleanup retains all configured green rows and statuses");
+}
+
+/**
+ * Configure one deployment and execute the complete accepted forward lifecycle
+ * through writer and reader switchover cleanup.
+ */
+void test_forward_lifecycle(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	Lifecycle_Context ctx { cl, admin, sim };
+
+	// Reset both simulator and Admin state before configuring role and membership data.
+	if (scenario_cleanup(admin, sim, ctx.backends) != EXIT_SUCCESS) {
+		BAIL_OUT("failed to reset normal lifecycle scenario");
+	}
+
+	set_read_only(sim, ctx.cluster.blue_writer, false);
+	set_read_only(sim, ctx.cluster.green_writer, false);
+	set_read_only(sim, ctx.cluster.blue_readers[0], true);
+	set_read_only(sim, ctx.cluster.blue_readers[1], true);
+	set_read_only(sim, ctx.cluster.green_readers[0], true);
+	set_read_only(sim, ctx.cluster.green_readers[1], true);
+
+	if (bgd_admin_setup(admin, ctx.cluster, ctx.hgs, BGD_Admin_Mode::explicit_configuration,
+		{ ctx.cluster.blue_writer, ctx.cluster.blue_readers[0], ctx.cluster.blue_readers[1] },
+		{ ctx.cluster.green_writer, ctx.cluster.green_readers[0] }) != EXIT_SUCCESS) {
+		BAIL_OUT("failed to configure normal lifecycle scenario");
+	}
+
+	test_available_phase(ctx);
+	int64_t initiated_reader_log = test_switchover_initiated_phase(ctx);
+	test_switchover_in_progress_phase(ctx, initiated_reader_log);
+	test_post_processing_phase(ctx, initiated_reader_log);
+	test_reader_completion_phase(ctx);
+}
+
 }  // namespace
 
 int main() {
@@ -196,193 +518,7 @@ int main() {
 	}
 	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
 
-	RDS_BGD_Cluster cluster = bgd_cluster_init();
-	BGD_Hostgroups hgs { 970, 971, 972, 973 };
-	vector<Endpoint> backends = topology_backends(cluster);
-	if (scenario_cleanup(admin, sim, backends) != EXIT_SUCCESS) {
-		BAIL_OUT("failed to reset normal lifecycle scenario");
-	}
-
-	set_read_only(sim, cluster.blue_writer, false);
-	set_read_only(sim, cluster.green_writer, false);
-	set_read_only(sim, cluster.blue_readers[0], true);
-	set_read_only(sim, cluster.blue_readers[1], true);
-	set_read_only(sim, cluster.green_readers[0], true);
-	set_read_only(sim, cluster.green_readers[1], true);
-
-	if (bgd_admin_setup(admin, cluster, hgs, BGD_Admin_Mode::explicit_configuration,
-		{ cluster.blue_writer, cluster.blue_readers[0], cluster.blue_readers[1] },
-		{ cluster.green_writer, cluster.green_readers[0] }) != EXIT_SUCCESS) {
-		BAIL_OUT("failed to configure normal lifecycle scenario");
-	}
-
-	auto [available_seq_rc, available_seq] = sim.probe_log_last_sequence();
-	if (available_seq_rc != EXIT_SUCCESS) BAIL_OUT("failed to read AVAILABLE probe baseline");
-	int rc = sim.topology_update(backends, topology_with_one_reader_pair(cluster, "AVAILABLE"));
-	int available_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, available_seq, hgs, "available", "AVAILABLE") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && available_rc == EXIT_SUCCESS,
-		"recorded AVAILABLE observation enters AVAILABLE runtime status");
-
-	int blue_connect_rc = connect_and_echo(cl).first;
-	int green_writer_pool_rc = set_default_hostgroup(admin, hgs.green_writer) == EXIT_SUCCESS ? connect_and_echo(cl).first : EXIT_FAILURE;
-	int green_reader_pool_rc = set_default_hostgroup(admin, hgs.green_reader) == EXIT_SUCCESS ? connect_and_echo(cl).first : EXIT_FAILURE;
-	int restore_blue_rc = set_default_hostgroup(admin, hgs.blue_writer);
-	auto [blue_pool_count_rc, blue_pool] = bgd_connection_pool_count(admin, hgs.blue_writer, cluster.blue_writer.hostname);
-	auto [green_writer_pool_count_rc, green_writer_pool] = bgd_connection_pool_count(admin, hgs.green_writer);
-	auto [green_reader_pool_count_rc, green_reader_pool] = bgd_connection_pool_count(admin, hgs.green_reader);
-	ok(blue_connect_rc == EXIT_SUCCESS && blue_pool_count_rc == EXIT_SUCCESS && blue_pool >= 1 &&
-		green_writer_pool_rc == EXIT_SUCCESS && green_writer_pool_count_rc == EXIT_SUCCESS && green_writer_pool >= 1 &&
-		green_reader_pool_rc == EXIT_SUCCESS && green_reader_pool_count_rc == EXIT_SUCCESS && green_reader_pool >= 1 &&
-		restore_blue_rc == EXIT_SUCCESS,
-		"AVAILABLE establishes blue and eligible green connection pools before lifecycle effects");
-
-	auto [available_repeat_seq_rc, available_repeat_seq] = sim.probe_log_last_sequence();
-	rc = available_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "AVAILABLE")) : EXIT_FAILURE;
-	int available_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, available_repeat_seq, cluster, hgs, "available repeat") : EXIT_FAILURE;
-	int available_repeat_status_rc = rc == EXIT_SUCCESS ?
-		wait_for_status(admin, sim, available_repeat_seq, hgs, "available repeat", "AVAILABLE") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && available_repeat_rc == EXIT_SUCCESS && available_repeat_status_rc == EXIT_SUCCESS &&
-		writer_in_expected_placement(admin, hgs, cluster, true, false),
-		"repeated AVAILABLE observation preserves status and writer placement");
-
-	auto [initiated_seq_rc, initiated_seq] = sim.probe_log_last_sequence();
-	rc = initiated_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "SWITCHOVER_INITIATED")) : EXIT_FAILURE;
-	int initiated_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, initiated_seq, hgs, "initiated", "WRITER_SWITCHOVER_INITIATED") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && initiated_rc == EXIT_SUCCESS,
-		"recorded SWITCHOVER_INITIATED observation enters initiated runtime status");
-
-	int64_t initiated_writer_log = last_read_only_log_time(admin, cluster.blue_writer);
-	int64_t initiated_reader_log = last_read_only_log_time(admin, cluster.blue_readers[0]);
-	set_read_only(sim, cluster.blue_writer, true);
-	set_read_only(sim, cluster.blue_readers[0], false);
-	auto [initiated_suppression_seq_rc, initiated_suppression_seq] = sim.probe_log_last_sequence();
-	int initiated_suppression_rc = initiated_suppression_seq_rc == EXIT_SUCCESS ?
-		wait_for_observation(admin, sim, initiated_suppression_seq, cluster, hgs, "initiated suppression") : EXIT_FAILURE;
-	ok(initiated_suppression_rc == EXIT_SUCCESS && writer_in_expected_placement(admin, hgs, cluster, true, false) &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE") &&
-		server_absent(admin, hgs.blue_writer, cluster.blue_readers[0]) &&
-		no_read_only_log_after(admin, cluster.blue_writer, initiated_writer_log) &&
-		no_read_only_log_after(admin, cluster.blue_readers[0], initiated_reader_log),
-		"initiated suppresses read-only placement changes for deployment members");
-
-	auto [initiated_repeat_seq_rc, initiated_repeat_seq] = sim.probe_log_last_sequence();
-	rc = initiated_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "SWITCHOVER_INITIATED")) : EXIT_FAILURE;
-	int initiated_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, initiated_repeat_seq, cluster, hgs, "initiated repeat") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && initiated_repeat_rc == EXIT_SUCCESS &&
-		wait_for_status(admin, sim, initiated_repeat_seq, hgs, "initiated repeat", "WRITER_SWITCHOVER_INITIATED") == EXIT_SUCCESS &&
-		writer_in_expected_placement(admin, hgs, cluster, true, false),
-		"repeated initiated observation preserves status and suppressed placement");
-
-	auto [progress_seq_rc, progress_seq] = sim.probe_log_last_sequence();
-	rc = progress_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "SWITCHOVER_IN_PROGRESS")) : EXIT_FAILURE;
-	int progress_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, progress_seq, hgs, "in progress", "WRITER_SWITCHOVER_IN_PROGRESS") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && progress_rc == EXIT_SUCCESS,
-		"recorded SWITCHOVER_IN_PROGRESS observation enters in-progress runtime status");
-
-	int progress_effects_rc = progress_rc == EXIT_SUCCESS ?
-		wait_for_in_progress_effects(admin, sim, progress_seq, cluster, hgs) : EXIT_FAILURE;
-	ok(progress_effects_rc == EXIT_SUCCESS,
-		"in-progress policy demotes the mapped blue writer while suppression keeps the blue reader placed");
-
-	auto [progress_suppression_seq_rc, progress_suppression_seq] = sim.probe_log_last_sequence();
-	int progress_suppression_rc = progress_suppression_seq_rc == EXIT_SUCCESS ?
-		wait_for_observation(admin, sim, progress_suppression_seq, cluster, hgs, "in-progress suppression") : EXIT_FAILURE;
-	ok(progress_suppression_rc == EXIT_SUCCESS && server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE") &&
-		server_absent(admin, hgs.blue_writer, cluster.blue_readers[0]) &&
-		no_read_only_log_after(admin, cluster.blue_readers[0], initiated_reader_log),
-		"in-progress continues to suppress the pending read-only promotion");
-
-	auto [progress_repeat_seq_rc, progress_repeat_seq] = sim.probe_log_last_sequence();
-	rc = progress_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "SWITCHOVER_IN_PROGRESS")) : EXIT_FAILURE;
-	int progress_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, progress_repeat_seq, cluster, hgs, "in-progress repeat") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && progress_repeat_rc == EXIT_SUCCESS &&
-		wait_for_status(admin, sim, progress_repeat_seq, hgs, "in-progress repeat", "WRITER_SWITCHOVER_IN_PROGRESS") == EXIT_SUCCESS &&
-		writer_in_expected_placement(admin, hgs, cluster, false, true),
-		"repeated in-progress observation preserves status and blue-writer demotion");
-
-	auto [post_seq_rc, post_seq] = sim.probe_log_last_sequence();
-	rc = post_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "SWITCHOVER_IN_POST_PROCESSING")) : EXIT_FAILURE;
-	int post_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, post_seq, hgs, "post processing", "WRITER_SWITCHOVER_POST_PROCESSING") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && post_rc == EXIT_SUCCESS,
-		"recorded SWITCHOVER_IN_POST_PROCESSING observation enters post-processing runtime status");
-
-	int post_runtime_effects_rc = post_rc == EXIT_SUCCESS ?
-		wait_for_post_runtime_effects(admin, sim, post_seq, cluster, hgs) : EXIT_FAILURE;
-	ok(post_runtime_effects_rc == EXIT_SUCCESS,
-		"post-processing restores writer placement and retains the mapped reader");
-
-	int post_pool_drain_rc = post_runtime_effects_rc == EXIT_SUCCESS ?
-		wait_for_blue_writer_pool_drain(admin, sim, post_seq, cluster, hgs) : EXIT_FAILURE;
-	ok(post_pool_drain_rc == EXIT_SUCCESS,
-		"post-processing drains existing pools for the mapped blue writer hostname");
-
-	auto [post_echo_rc, post_echo] = connect_and_echo(cl);
-	ok(post_echo_rc == EXIT_SUCCESS && post_echo.find(cluster.green_writer.ip) != string::npos,
-		"post-processing pins a new mapped-blue writer connection to the green backend IP");
-
-	auto [post_suppression_seq_rc, post_suppression_seq] = sim.probe_log_last_sequence();
-	int post_suppression_rc = post_suppression_seq_rc == EXIT_SUCCESS ?
-		wait_for_observation(admin, sim, post_suppression_seq, cluster, hgs, "post-processing suppression") : EXIT_FAILURE;
-	ok(post_suppression_rc == EXIT_SUCCESS && server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE") &&
-		server_absent(admin, hgs.blue_writer, cluster.blue_readers[0]) &&
-		no_read_only_log_after(admin, cluster.blue_readers[0], initiated_reader_log),
-		"post-processing continues to suppress read-only placement changes for the mapped reader");
-
-	auto [post_repeat_seq_rc, post_repeat_seq] = sim.probe_log_last_sequence();
-	rc = post_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, topology_with_one_reader_pair(cluster, "SWITCHOVER_IN_POST_PROCESSING")) : EXIT_FAILURE;
-	int post_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, post_repeat_seq, cluster, hgs, "post-processing repeat") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && post_repeat_rc == EXIT_SUCCESS &&
-		wait_for_status(admin, sim, post_repeat_seq, hgs, "post-processing repeat", "WRITER_SWITCHOVER_POST_PROCESSING") == EXIT_SUCCESS &&
-		writer_in_expected_placement(admin, hgs, cluster, true, false) &&
-		server_has_status(admin, hgs.blue_reader, cluster.blue_readers[0], "ONLINE"),
-		"repeated post-processing observation preserves status and mapped placement");
-
-	auto [completed_seq_rc, completed_seq] = sim.probe_log_last_sequence();
-	rc = completed_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, target_only_completed(cluster)) : EXIT_FAILURE;
-	int completed_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, completed_seq, hgs, "target-only completed", "READER_SWITCHOVER_IN_PROGRESS") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && completed_rc == EXIT_SUCCESS,
-		"target-only SWITCHOVER_COMPLETED observation enters inferred reader-switchover status");
-
-	ok(green_rows_remain_online(admin, hgs, cluster),
-		"writer completion defers green-row cleanup until the reader signal");
-
-	auto [completed_repeat_seq_rc, completed_repeat_seq] = sim.probe_log_last_sequence();
-	rc = completed_repeat_seq_rc == EXIT_SUCCESS ? sim.topology_update(backends, target_only_completed(cluster)) : EXIT_FAILURE;
-	int completed_repeat_rc = rc == EXIT_SUCCESS ? wait_for_observation(admin, sim, completed_repeat_seq, cluster, hgs, "target-only completed repeat") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && completed_repeat_rc == EXIT_SUCCESS &&
-		wait_for_status(admin, sim, completed_repeat_seq, hgs, "target-only completed repeat", "READER_SWITCHOVER_IN_PROGRESS") == EXIT_SUCCESS &&
-		green_rows_remain_online(admin, hgs, cluster),
-		"repeated target-only completed observation preserves reader-switchover phase and green rows");
-
-	auto [empty_seq_rc, empty_seq] = sim.probe_log_last_sequence();
-	rc = empty_seq_rc == EXIT_SUCCESS ? sim.topology_delete(backends) : EXIT_FAILURE;
-	int empty_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, empty_seq, hgs, "present empty", "NONE") : EXIT_FAILURE;
-	ok(rc == EXIT_SUCCESS && empty_rc == EXIT_SUCCESS,
-		"present-but-empty topology completes reader cleanup and reaches NONE");
-
-	ok(server_has_status(admin, hgs.blue_reader, cluster.blue_readers[1], "ONLINE"),
-		"final cleanup restores the unmatched blue reader to ONLINE");
-
-	auto [empty_green_rc, empty_green_probe] = bgd_wait_for_probe(sim, empty_seq, cluster.green_writer.endpoint(),
-		RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin, kScenario, "present-empty green observation",
-		hgs.blue_writer, { hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
-	const uint64_t blue_probe_baseline = empty_green_rc == EXIT_SUCCESS ? empty_green_probe.sequence_id : empty_seq;
-	auto [blue_after_empty_rc, blue_after_empty_probe] = bgd_wait_for_probe(sim, blue_probe_baseline,
-		cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin, kScenario,
-		"post-cleanup blue probe", hgs.blue_writer,
-		{ hgs.blue_writer, hgs.blue_reader, hgs.green_writer, hgs.green_reader });
-	ok(empty_green_rc == EXIT_SUCCESS && blue_after_empty_rc == EXIT_SUCCESS &&
-		empty_green_probe.sequence_id < blue_after_empty_probe.sequence_id,
-		"final cleanup removes the direct green probe pin and resumes blue-IP metadata probing");
-
-	auto [final_green_writer_pool_rc, final_green_writer_pool] = bgd_connection_pool_count(admin, hgs.green_writer);
-	auto [final_green_reader_pool_rc, final_green_reader_pool] = bgd_connection_pool_count(admin, hgs.green_reader);
-	ok(final_green_writer_pool_rc == EXIT_SUCCESS && final_green_writer_pool == 0 &&
-		final_green_reader_pool_rc == EXIT_SUCCESS && final_green_reader_pool == 0,
-		"final cleanup drains eligible green hostgroup pools");
-
-	ok(green_rows_remain_online(admin, hgs, cluster),
-		"final cleanup retains all configured green rows and statuses");
+	test_forward_lifecycle(cl, admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final lifecycle TAP state");

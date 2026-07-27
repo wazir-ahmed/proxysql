@@ -1,6 +1,14 @@
 /**
  * @file test_rds_bgd_worker_replacement-t.cpp
  * @brief AWS RDS Blue/Green worker replacement coverage through runtime behavior.
+ *
+ * Test coverage:
+ * 1. Replaces a pre-completion worker after definition and membership changes.
+ * 2. Distinguishes irrelevant server changes from TLS and eligibility inputs.
+ * 3. Replaces a worker after writer completion using the fresh completed path.
+ *
+ * Probe order, departing cleanup, current runtime membership, and stale-target
+ * avoidance provide the observable replacement surface.
  */
 
 #include <cerrno>
@@ -179,24 +187,12 @@ Replacement_Probe_Chain wait_for_replacement_probe_chain(MYSQL* admin, RDS_BGD_S
 	return { blue_chain.table_rc, blue_chain.table, blue_chain.blue_rc, blue_chain.blue, green_rc, green };
 }
 
-}  // namespace
-
-int main() {
-	plan(28);
-
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// Changing active BGD input during a pre-completion phase stops the old worker.  Its
-	// observable cleanup must restore blue placement before a new definition is enabled.
+/**
+ * Replace active pre-completion input and verify one-shot departing cleanup,
+ * fresh probe order, current membership, and stale-target avoidance.
+ */
+void test_definition_replacement(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Reach in-progress and establish a causal blue pool before changing the definition.
 	RDS_BGD_Cluster replacement = bgd_cluster_init();
 	RDS_BGD_Cluster replacement_fresh = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups original_hgs { 1340, 1341, 1342, 1343 };
@@ -334,16 +330,21 @@ int main() {
 		"deleting the active BGD row performs phase-appropriate departing cleanup");
 	ok(runtime_definition_absent(admin, replacement_hgs.blue_writer),
 		"deleting the active BGD row removes its runtime worker definition");
+}
 
-	// Weight and comment are intentionally absent from the worker definition.  They must not
-	// reset a metadata worker back through a fresh table check; TLS, which is an input, must.
+/**
+ * Verify that irrelevant weight/comment changes do not replace a worker while
+ * TLS, eligible membership, and eligibility transitions do.
+ */
+void test_relevant_and_membership_changes(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Establish an AVAILABLE metadata baseline before mutating server inputs.
 	RDS_BGD_Cluster irrelevant = bgd_cluster_2_init();
 	BGD_Hostgroups irrelevant_hgs { 1350, 1351, 1352, 1353 };
 	vector<Endpoint> irrelevant_backends = scenario_backends(irrelevant);
 	if (reset_scenario(admin, sim, irrelevant_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset irrelevant-input scenario");
 	set_writers_writable(sim, irrelevant);
 	auto [irrelevant_start_rc, irrelevant_start] = sim.probe_log_last_sequence();
-	rc = irrelevant_start_rc == EXIT_SUCCESS ? sim.topology_update(irrelevant_backends,
+	int rc = irrelevant_start_rc == EXIT_SUCCESS ? sim.topology_update(irrelevant_backends,
 		topology_with_readers(irrelevant, "AVAILABLE")) : EXIT_FAILURE;
 	int irrelevant_setup_rc = rc == EXIT_SUCCESS ? bgd_admin_setup(admin, irrelevant, irrelevant_hgs,
 		BGD_Admin_Mode::explicit_configuration,
@@ -383,8 +384,7 @@ int main() {
 	ok(runtime_server_ssl(admin, irrelevant_hgs.green_writer, irrelevant.green_writer, 1),
 		"relevant TLS input change is present in the replacement runtime server row");
 
-	// With active and all definition fields fixed, eligible membership alone must replace
-	// the worker.  Eligibility transitions into and out of OFFLINE_SOFT must do the same.
+	// Replace eligible membership, then move it offline and online with fixed definition fields.
 	auto [membership_seq_rc, membership_seq] = sim.probe_log_last_sequence();
 	rc = membership_seq_rc == EXIT_SUCCESS ? execute_all(admin, {
 		"INSERT INTO mysql_servers(hostgroup_id,hostname,port,status,use_ssl,comment) VALUES (1353," +
@@ -432,16 +432,21 @@ int main() {
 		online_chain.table.sequence_id < online_chain.blue.sequence_id &&
 		persistent_server_status(admin, irrelevant_hgs.green_reader, irrelevant.green_readers[1], "ONLINE"),
 		"returning green membership online alone restarts the active worker");
+}
 
-	// A worker can also be replaced after AWS has already published writer completion.  The
-	// replacement must take the accepted fresh completed path, not reuse its predecessor's map.
+/**
+ * Replace a worker after writer completion and verify that it performs fresh
+ * blue discovery before republishing reader-switchover behavior.
+ */
+void test_replacement_after_completed_entry(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Reach reader switchover, then change a definition field to force replacement.
 	RDS_BGD_Cluster completed = bgd_cluster_3_init();
 	BGD_Hostgroups completed_hgs { 1360, 1361, 1362, 1363 };
 	vector<Endpoint> completed_backends = scenario_backends(completed);
 	if (reset_scenario(admin, sim, completed_backends) != EXIT_SUCCESS) BAIL_OUT("failed to reset completed replacement scenario");
 	set_writers_writable(sim, completed);
 	auto [completed_start_rc, completed_start] = sim.probe_log_last_sequence();
-	rc = completed_start_rc == EXIT_SUCCESS ? sim.topology_update(completed_backends,
+	int rc = completed_start_rc == EXIT_SUCCESS ? sim.topology_update(completed_backends,
 		topology_with_readers(completed, "SWITCHOVER_IN_PROGRESS")) : EXIT_FAILURE;
 	int completed_setup_rc = rc == EXIT_SUCCESS ? bgd_admin_setup(admin, completed, completed_hgs,
 		BGD_Admin_Mode::explicit_configuration,
@@ -473,6 +478,27 @@ int main() {
 		"completed-phase replacement follows its fresh table check with blue metadata");
 	ok(completed_replacement_status_rc == EXIT_SUCCESS,
 		"completed-phase replacement republishes the accepted reader-switchover behavior");
+}
+
+}  // namespace
+
+int main() {
+	plan(28);
+
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_definition_replacement(cl, admin, sim);
+	test_relevant_and_membership_changes(admin, sim);
+	test_replacement_after_completed_entry(admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final worker-replacement TAP state");

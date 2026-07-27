@@ -1,6 +1,12 @@
 /**
  * @file test_rds_bgd_server_policy-t.cpp
  * @brief AWS RDS Blue/Green server eligibility, persistence, and drain policy coverage.
+ *
+ * Test coverage:
+ * 1. Separates eligible mapped readers from other configured readers.
+ * 2. Excludes offline blue rows and verifies writer fallback placement.
+ * 3. Exercises green connection draining across public server statuses.
+ * 4. Preserves administrator-owned BGD configuration during discovery.
  */
 
 #include <cstdlib>
@@ -203,24 +209,12 @@ bool configured_green_statuses_match(MYSQL* admin, const vector<Green_Server>& s
 	return true;
 }
 
-}  // namespace
-
-int main() {
-	plan(13);
-
-	CommandLine cl {};
-	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
-	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
-	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
-	RDS_BGD_Simulator sim {};
-	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
-		mysql_close(admin);
-		BAIL_OUT("failed to connect to the SQLite3-server simulator");
-	}
-	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
-
-	// Eligible reader matching is independent from other configured readers. Rollback must leave
-	// every configured green row and its pre-existing pool untouched.
+/**
+ * Verify that eligible reader matching is independent from other configured
+ * readers and rollback preserves administrator-owned green rows and pools.
+ */
+void test_matched_and_unmatched_readers(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Establish AVAILABLE, green pool baselines, and exact green-row snapshots.
 	RDS_BGD_Cluster matched = bgd_cluster_init();
 	BGD_Hostgroups matched_hgs { 1280, 1281, 1282, 1283 };
 	vector<Endpoint> matched_backends = scenario_backends(matched);
@@ -276,10 +270,14 @@ int main() {
 		matched_reader_after >= matched_reader_pool && snapshots_unchanged(admin, matched_hgs,
 			matched_admin_snapshot, matched_runtime_snapshot),
 		"matched-unmatched: rollback preserves exact green rows and does not drain their established pools");
+}
 
-	// Offline blue rows are excluded from map construction. With the remaining reader unmatched
-	// because its green counterpart is OFFLINE_HARD, the monitor keeps the writer temporarily in
-	// the reader hostgroup.
+/**
+ * Verify that offline blue rows are excluded from mapping and an unmatched
+ * eligible reader causes temporary writer fallback into the reader hostgroup.
+ */
+void test_offline_blue_fallback(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure distinct offline states before publishing post-processing topology.
 	RDS_BGD_Cluster fallback = bgd_cluster_2_init();
 	RDS_BGD_Cluster fallback_extra = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups fallback_hgs { 1290, 1291, 1292, 1293 };
@@ -313,7 +311,7 @@ int main() {
 	fallback_topology.push_back({ fallback_extra.green_readers[0].hostname,
 		fallback_extra.green_readers[0].hostname, 3306, "BLUE_GREEN_DEPLOYMENT_TARGET",
 		"SWITCHOVER_IN_POST_PROCESSING" });
-	rc = fallback_seq_rc == EXIT_SUCCESS ?
+	int rc = fallback_seq_rc == EXIT_SUCCESS ?
 		sim.topology_update(fallback_backends, fallback_topology) : EXIT_FAILURE;
 	int fallback_post_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, fallback_seq,
 		"offline-fallback", fallback_hgs, "post processing", "WRITER_SWITCHOVER_POST_PROCESSING") : EXIT_FAILURE;
@@ -340,10 +338,14 @@ int main() {
 		persistent_server_has_status(admin, fallback_hgs.green_reader, fallback.green_readers[1], "ONLINE") &&
 		persistent_server_has_status(admin, fallback_hgs.green_reader, fallback_extra.green_readers[0], "ONLINE"),
 		"offline-fallback: matched OFFLINE_SOFT/HARD blue rows are excluded, so the sole eligible unmatched reader triggers writer fallback");
+}
 
-	// The cleanup matrix covers one persistent green row per public status.  A separate
-	// ONLINE router row creates an isolated pool after each target status is loaded, making
-	// every pre-cleanup value a causal baseline for the BGD cleanup policy.
+/**
+ * Exercise successful cleanup against green rows in each public status and
+ * verify which causal connection pools are drained or preserved.
+ */
+void test_green_drain_status_matrix(const CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Configure one persistent green row and one isolated pool baseline per status.
 	RDS_BGD_Cluster matrix = bgd_cluster_3_init();
 	RDS_BGD_Cluster matrix_extra = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups matrix_hgs { 1300, 1301, 1302, 1303 };
@@ -405,7 +407,7 @@ int main() {
 		"green-drain-matrix: every status has a nonzero causal pool immediately before cleanup");
 
 	auto [matrix_available_seq_rc, matrix_available_seq] = sim.probe_log_last_sequence();
-	rc = matrix_available_seq_rc == EXIT_SUCCESS ?
+	int rc = matrix_available_seq_rc == EXIT_SUCCESS ?
 		sim.topology_update(matrix_backends, topology_with_reader_pairs(matrix, "AVAILABLE", 2)) : EXIT_FAILURE;
 	int matrix_available_rc = rc == EXIT_SUCCESS ? wait_for_status(admin, sim, matrix_available_seq,
 		"green-drain-matrix", matrix_hgs, "available", "AVAILABLE") : EXIT_FAILURE;
@@ -441,8 +443,14 @@ int main() {
 	ok(matrix_none_rc == EXIT_SUCCESS && snapshots_unchanged(admin, matrix_hgs,
 		matrix_admin_snapshot, matrix_runtime_snapshot),
 		"green-drain-matrix: successful cleanup retains every green row and its original status exactly");
+}
 
-	// Automatic discovery must defer to an administrator-owned explicit BGD row and green row.
+/**
+ * Run automatic discovery beside inactive explicit configuration and verify
+ * that administrator-owned BGD and green rows remain unchanged.
+ */
+void test_automatic_discovery_preserves_admin_ownership(MYSQL* admin, RDS_BGD_Simulator& sim) {
+	// Snapshot explicit ownership before standalone automatic discovery runs.
 	RDS_BGD_Cluster automatic = bgd_cluster_1_deployment_b_init();
 	BGD_Hostgroups automatic_hgs { 1310, 1311, 1312, 1313 };
 	vector<Endpoint> automatic_backends = scenario_backends(automatic);
@@ -456,7 +464,8 @@ int main() {
 	auto [automatic_bgd_snapshot_rc, automatic_bgd_snapshot] = mysql_query_ext_rows(admin,
 		"SELECT writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup,active,writer_is_also_reader,check_interval_ms,check_timeout_ms,comment FROM mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=1310");
 	auto [automatic_seq_rc, automatic_seq] = sim.probe_log_last_sequence();
-	rc = automatic_seq_rc == EXIT_SUCCESS ? sim.topology_update(automatic_backends, automatic.get_topology("AVAILABLE")) : EXIT_FAILURE;
+	int rc = automatic_seq_rc == EXIT_SUCCESS ?
+		sim.topology_update(automatic_backends, automatic.get_topology("AVAILABLE")) : EXIT_FAILURE;
 	auto [automatic_probe_rc, automatic_probe] = rc == EXIT_SUCCESS ?
 		bgd_wait_for_probe(sim, automatic_seq, automatic.blue_writer.endpoint(),
 			RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0, admin,
@@ -475,6 +484,28 @@ int main() {
 		automatic_bgd_after == automatic_bgd_snapshot && snapshots_unchanged(admin, automatic_hgs,
 			automatic_admin_snapshot, automatic_runtime_snapshot),
 		"automatic-ownership: discovery never overwrites administrator-owned BGD configuration or green rows/statuses");
+}
+
+}  // namespace
+
+int main() {
+	plan(13);
+
+	CommandLine cl {};
+	if (cl.getEnv()) BAIL_OUT("failed to load TAP environment");
+	MYSQL* admin = init_mysql_conn(cl.admin_host, cl.admin_port, cl.admin_username, cl.admin_password);
+	if (admin == nullptr) BAIL_OUT("failed to connect to ProxySQL Admin");
+	RDS_BGD_Simulator sim {};
+	if (sim.connect(cl.host, 3306, cl.username, cl.password) != EXIT_SUCCESS) {
+		mysql_close(admin);
+		BAIL_OUT("failed to connect to the SQLite3-server simulator");
+	}
+	if (bgd_register_test_cleanup(admin, sim) != EXIT_SUCCESS) BAIL_OUT("failed to register BGD TAP cleanup");
+
+	test_matched_and_unmatched_readers(cl, admin, sim);
+	test_offline_blue_fallback(admin, sim);
+	test_green_drain_status_matrix(cl, admin, sim);
+	test_automatic_discovery_preserves_admin_ownership(admin, sim);
 
 	int cleanup_rc = bgd_finish_test_cleanup(admin, sim);
 	if (cleanup_rc != EXIT_SUCCESS) BAIL_OUT("failed to clean final server-policy TAP state");
