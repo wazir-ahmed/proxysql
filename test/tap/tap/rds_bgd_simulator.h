@@ -73,6 +73,31 @@ public:
 	vector<Endpoint> get_writer_hosts();
 
 	/**
+	 * @brief Returns the blue writer and configured blue readers.
+	 *
+	 * @return Blue deployment endpoints keyed by simulator IP address.
+	 */
+	vector<Endpoint> get_blue_endpoints();
+
+	/**
+	 * @brief Returns the green writer and configured green readers.
+	 *
+	 * @return Green deployment endpoints keyed by simulator IP address.
+	 */
+	vector<Endpoint> get_green_endpoints();
+
+	/**
+	 * @brief Returns every simulator IP/port endpoint in this cluster.
+	 *
+	 * @details Includes both writers and all configured blue and green readers.
+	 *   Tests use this list when resetting or publishing topology for a complete
+	 *   simulated deployment.
+	 *
+	 * @return Writer and reader endpoints keyed by simulator IP address.
+	 */
+	vector<Endpoint> get_endpoints();
+
+	/**
 	 * @brief Builds the topology rows published by the simulated writers.
 	 *
 	 * @details Creates one source row for the blue writer and one target row for the green

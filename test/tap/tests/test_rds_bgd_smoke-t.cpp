@@ -17,12 +17,15 @@
 #include "command_line.h"
 #include "utils.h"
 
-int configure_proxysql_for_bgd(MYSQL* admin, RDS_BGD_Cluster& cluster) {
-	RDS_BGD_Host& writer = cluster.blue_writer;
+int configure_explicit_bgd(MYSQL* admin, RDS_BGD_Cluster& c) {
+	RDS_BGD_Host& writer = c.blue_writer;
 	return execute_all(admin, {
+		// Start from an empty BGD configuration owned by this test.
 		"DELETE FROM mysql_servers",
 		"DELETE FROM mysql_replication_hostgroups",
 		"DELETE FROM mysql_aws_rds_bgd_hostgroups",
+
+		// Register one active blue/green deployment and its blue writer.
 		"INSERT INTO mysql_replication_hostgroups(writer_hostgroup,reader_hostgroup) "
 			"VALUES (10,20)",
 		"INSERT INTO mysql_aws_rds_bgd_hostgroups("
@@ -31,6 +34,8 @@ int configure_proxysql_for_bgd(MYSQL* admin, RDS_BGD_Cluster& cluster) {
 			"VALUES (10,20,30,40,1,0,100,800,'BGD simulator smoke test')",
 		"INSERT INTO mysql_servers(hostgroup_id,hostname,port,use_ssl,comment) VALUES (10,'" +
 			writer.hostname + "'," + std::to_string(writer.port) + ",0,'blue writer')",
+
+		// Use the simulator credentials and start explicit monitoring.
 		"SET mysql-monitor_username='testuser'",
 		"SET mysql-monitor_password='testuser'",
 		"SET mysql-monitor_enabled='true'",
@@ -45,27 +50,28 @@ int configure_proxysql_for_bgd(MYSQL* admin, RDS_BGD_Cluster& cluster) {
  * through worker startup and direct green-writer probing.
  */
 void test_available_discovery(MYSQL* admin, RDS_BGD_Simulator& sim) {
-	// Prepare writable writers so both recorded endpoints accept monitor probes.
-	RDS_BGD_Cluster cluster = bgd_cluster_init();
-	for (Endpoint& writer : cluster.get_writer_hosts()) {
+	RDS_BGD_Cluster c = bgd_cluster_init();
+
+	// Both simulated writers must accept monitor probes before topology is published.
+	for (Endpoint& writer : c.get_writer_hosts()) {
 		if (sim.read_only_update(writer, false) != EXIT_SUCCESS) {
 			BAIL_OUT("failed to configure writer read_only state");
 		}
 	}
 
-	// Establish the probe baseline, then publish the topology before starting the worker.
-	auto [rc, last_seq] = sim.probe_log_last_sequence();
-	if (rc != EXIT_SUCCESS) {
+	// Publish AVAILABLE topology before starting the worker, then retain the probe baseline.
+	auto [seq_rc, seq] = sim.probe_log_last_sequence();
+	if (seq_rc != EXIT_SUCCESS) {
 		BAIL_OUT("failed to read the last BGD probe-log sequence");
 	}
-	rc = sim.topology_update(cluster.get_writers(), cluster.get_topology("AVAILABLE"));
+	int rc = sim.topology_update(c.get_writers(), c.get_topology("AVAILABLE"));
 	ok(rc == EXIT_SUCCESS, "publish AVAILABLE topology to both writer IPs");
 	if (rc != EXIT_SUCCESS) {
 		BAIL_OUT("failed to publish BGD topology");
 	}
 
-	// Enable explicit BGD monitoring and wait for its public runtime state.
-	if (configure_proxysql_for_bgd(admin, cluster) != EXIT_SUCCESS) {
+	// Start explicit monitoring. The worker must publish its public AVAILABLE state.
+	if (configure_explicit_bgd(admin, c) != EXIT_SUCCESS) {
 		BAIL_OUT("failed to configure ProxySQL for BGD monitoring");
 	}
 	rc = wait_for_cond(
@@ -75,9 +81,9 @@ void test_available_discovery(MYSQL* admin, RDS_BGD_Simulator& sim) {
 		3);
 	ok(rc == EXIT_SUCCESS, "ProxySQL enters the AVAILABLE BGD state");
 
-	// Confirm that topology discovery selected the recorded green writer endpoint.
+	// Discovery then switches to the recorded green writer IP for the direct metadata probe.
 	auto [probe_rc, green_probe] = sim.wait_for_probe_log(
-		last_seq, cluster.green_writer.endpoint(),
+		seq, c.green_writer.endpoint(),
 		RDS_BGD_Probe_Kind::metadata, 3000, 0);
 	ok(probe_rc == EXIT_SUCCESS, "ProxySQL probes topology directly on the green writer IP over plaintext");
 }

@@ -15,7 +15,7 @@ using namespace std;
 inline int execute_all(MYSQL* admin, vector<string> queries);
 
 inline RDS_BGD_Cluster bgd_cluster_init() {
-	return {
+	RDS_BGD_Cluster cluster {
 		{ "db-1.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.11", 3306 },
 		{ "db-1-green-iqu47r.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.14", 3306 },
 		{
@@ -27,10 +27,11 @@ inline RDS_BGD_Cluster bgd_cluster_init() {
 			{ "db-1-reader-2-green-3fpjuu.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.16", 3306 },
 		},
 	};
+	return cluster;
 }
 
 inline RDS_BGD_Cluster bgd_cluster_1_deployment_b_init() {
-	return {
+	RDS_BGD_Cluster cluster {
 		{ "db-1.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.11", 3306 },
 		{ "db-1-green-s7m2kx.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.17", 3306 },
 		{
@@ -42,10 +43,11 @@ inline RDS_BGD_Cluster bgd_cluster_1_deployment_b_init() {
 			{ "db-1-reader-2-green-w6h3rz.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.19", 3306 },
 		},
 	};
+	return cluster;
 }
 
 inline RDS_BGD_Cluster bgd_cluster_2_init() {
-	return {
+	RDS_BGD_Cluster cluster {
 		{ "db-2.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.20", 3306 },
 		{ "db-2-green-iqu47r.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.23", 3306 },
 		{
@@ -57,10 +59,11 @@ inline RDS_BGD_Cluster bgd_cluster_2_init() {
 			{ "db-2-reader-2-green-3fpjuu.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.25", 3306 },
 		},
 	};
+	return cluster;
 }
 
 inline RDS_BGD_Cluster bgd_cluster_3_init() {
-	return {
+	RDS_BGD_Cluster cluster {
 		{ "db-3.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.26", 3306 },
 		{ "db-3-green-iqu47r.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.29", 3306 },
 		{
@@ -72,6 +75,7 @@ inline RDS_BGD_Cluster bgd_cluster_3_init() {
 			{ "db-3-reader-2-green-3fpjuu.c1yqcg0ie39o.eu-north-1.rds.amazonaws.com", "127.10.0.31", 3306 },
 		},
 	};
+	return cluster;
 }
 
 enum class BGD_Admin_Mode {
@@ -86,41 +90,84 @@ struct BGD_Hostgroups {
 	int green_reader;
 };
 
-inline string bgd_sql_quote(const string& value) {
+inline vector<RDS_BGD_Topology_Row> bgd_topology_with_readers(RDS_BGD_Cluster& cluster, string status) {
+	vector<RDS_BGD_Topology_Row> rows = cluster.get_topology(status);
+	for (RDS_BGD_Host& host : cluster.blue_readers) {
+		rows.push_back({ host.hostname, host.hostname, host.port, "BLUE_GREEN_DEPLOYMENT_SOURCE", status });
+	}
+	for (RDS_BGD_Host& host : cluster.green_readers) {
+		rows.push_back({ host.hostname, host.hostname, host.port, "BLUE_GREEN_DEPLOYMENT_TARGET", status });
+	}
+	return rows;
+}
+
+inline int bgd_set_writer_read_only_0(RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster) {
+	if (sim.read_only_update(cluster.blue_writer.host_endpoint(), false) != EXIT_SUCCESS) {
+		diag("Error: failed to set read_only=0 for the simulated blue writer");
+		return EXIT_FAILURE;
+	}
+
+	if (sim.read_only_update(cluster.green_writer.host_endpoint(), false) != EXIT_SUCCESS) {
+		diag("Error: failed to set read_only=0 for the simulated green writer");
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+inline string bgd_sql_quote(string value) {
 	string quoted { "'" };
 	for (char c : value) {
 		quoted += c;
-		if (c == '\'') quoted += '\'';
+		if (c == '\'') {
+			quoted += '\'';
+		}
 	}
 	quoted += '\'';
 	return quoted;
 }
 
 inline int bgd_admin_cleanup(MYSQL* admin) {
-	int config_rc = execute_all(admin, {
+	vector<string> config_queries {
 		"SET mysql-aws_blue_green_deployment_auto_discovery='false'",
 		"LOAD MYSQL VARIABLES TO RUNTIME",
 		"DELETE FROM mysql_aws_rds_bgd_hostgroups",
 		"LOAD MYSQL SERVERS TO RUNTIME",
-	});
-	int state_rc = execute_all(admin, {
+	};
+	int config_rc = execute_all(admin, config_queries);
+
+	vector<string> state_queries {
 		"DELETE FROM mysql_servers",
 		"DELETE FROM mysql_replication_hostgroups",
 		"UPDATE mysql_users SET default_hostgroup=0 WHERE username='testuser'",
 		"LOAD MYSQL SERVERS TO RUNTIME",
 		"LOAD MYSQL USERS TO RUNTIME",
-	});
-	return config_rc == EXIT_SUCCESS && state_rc == EXIT_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+	};
+	int state_rc = execute_all(admin, state_queries);
+
+	if (config_rc != EXIT_SUCCESS || state_rc != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
 }
 
 inline int bgd_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
 	int admin_rc = bgd_admin_cleanup(admin);
-	int quiescence_rc = sim.wait_for_probe_quiescence(3000, 1200);
+	if (admin_rc != EXIT_SUCCESS) {
+		diag("Error: failed to clean ProxySQL BGD test state");
+	}
+
 	int simulator_rc = sim.cleanup();
-	return admin_rc == EXIT_SUCCESS && quiescence_rc == EXIT_SUCCESS &&
-		simulator_rc == EXIT_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+	if (simulator_rc != EXIT_SUCCESS) {
+		diag("Error: failed to clean SQLite3-server simulator state");
+	}
+
+	if (admin_rc != EXIT_SUCCESS || simulator_rc != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
 }
 
+// Temporary compatibility for BGD TAP files that still use exit-time cleanup.
 namespace bgd_cleanup_detail {
 
 static MYSQL* exit_admin = nullptr;
@@ -128,24 +175,38 @@ static RDS_BGD_Simulator* exit_simulator = nullptr;
 static bool exit_handler_registered = false;
 
 inline void cleanup_at_exit() {
-	if (exit_admin == nullptr || exit_simulator == nullptr) return;
+	if (exit_admin == nullptr || exit_simulator == nullptr) {
+		return;
+	}
 
 	MYSQL* admin = exit_admin;
 	RDS_BGD_Simulator* simulator = exit_simulator;
 	exit_admin = nullptr;
 	exit_simulator = nullptr;
-	bgd_test_cleanup(admin, *simulator);
+
+	int rc = bgd_test_cleanup(admin, *simulator);
+	if (rc != EXIT_SUCCESS) {
+		diag("Error: exit-time BGD TAP cleanup failed");
+	}
 }
 
 }  // namespace bgd_cleanup_detail
 
 inline int bgd_register_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
 	using namespace bgd_cleanup_detail;
-	if (exit_admin != nullptr || exit_simulator != nullptr) return EALREADY;
+	if (exit_admin != nullptr || exit_simulator != nullptr) {
+		diag("Error: BGD TAP cleanup is already registered");
+		return EALREADY;
+	}
+
 	if (!exit_handler_registered) {
-		if (atexit(cleanup_at_exit) != 0) return EXIT_FAILURE;
+		if (atexit(cleanup_at_exit) != 0) {
+			diag("Error: failed to register exit-time BGD TAP cleanup");
+			return EXIT_FAILURE;
+		}
 		exit_handler_registered = true;
 	}
+
 	exit_admin = admin;
 	exit_simulator = &sim;
 	return EXIT_SUCCESS;
@@ -161,11 +222,11 @@ inline int bgd_finish_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
 }
 
 inline int bgd_admin_add_servers(
-	MYSQL* admin, const RDS_BGD_Cluster& cluster, const BGD_Hostgroups& hostgroups,
-	const vector<RDS_BGD_Host>& hosts, bool green, int use_ssl)
+	MYSQL* admin, RDS_BGD_Cluster cluster, BGD_Hostgroups hostgroups,
+	vector<RDS_BGD_Host> hosts, bool green, int use_ssl)
 {
 	vector<string> queries {};
-	for (const RDS_BGD_Host& host : hosts) {
+	for (RDS_BGD_Host& host : hosts) {
 		int hostgroup = hostgroups.blue_reader;
 		if (!green && host.hostname == cluster.blue_writer.hostname) {
 			hostgroup = hostgroups.blue_writer;
@@ -174,20 +235,27 @@ inline int bgd_admin_add_servers(
 		} else if (green) {
 			hostgroup = hostgroups.green_reader;
 		}
-		queries.push_back(
+
+		string color = green ? "green " : "blue ";
+		string comment = bgd_sql_quote("BGD TAP " + color + host.ip);
+		string query =
 			"INSERT INTO mysql_servers(hostgroup_id,hostname,port,status,use_ssl,comment) VALUES (" +
 			to_string(hostgroup) + "," + bgd_sql_quote(host.hostname) + "," +
 			to_string(host.port) + ",'ONLINE'," + to_string(use_ssl) + "," +
-			bgd_sql_quote("BGD TAP " + (green ? string("green ") : string("blue ")) + host.ip) + ")");
+			comment + ")";
+		queries.push_back(query);
 	}
-	return execute_all(admin, queries);
+
+	int rc = execute_all(admin, queries);
+	return rc;
 }
 
 inline int bgd_admin_setup(
-	MYSQL* admin, const RDS_BGD_Cluster& cluster, const BGD_Hostgroups& hostgroups,
-	BGD_Admin_Mode mode, const vector<RDS_BGD_Host>& blue_hosts,
-	const vector<RDS_BGD_Host>& green_hosts = {}, int blue_use_ssl = 0, int green_use_ssl = 0)
+	MYSQL* admin, RDS_BGD_Cluster cluster, BGD_Hostgroups hostgroups,
+	BGD_Admin_Mode mode, vector<RDS_BGD_Host> blue_hosts,
+	vector<RDS_BGD_Host> green_hosts = {}, int blue_use_ssl = 0, int green_use_ssl = 0)
 {
+	string auto_discovery = mode == BGD_Admin_Mode::automatic ? "true" : "false";
 	vector<string> queries {
 		"INSERT INTO mysql_replication_hostgroups(writer_hostgroup,reader_hostgroup) VALUES (" +
 			to_string(hostgroups.blue_writer) + "," + to_string(hostgroups.blue_reader) + ")",
@@ -196,174 +264,296 @@ inline int bgd_admin_setup(
 		"SET mysql-monitor_enabled='true'",
 		"SET mysql-monitor_read_only_interval=100",
 		"SET mysql-monitor_aws_rds_topology_discovery_interval=1",
-		"SET mysql-aws_blue_green_deployment_auto_discovery='" +
-			string(mode == BGD_Admin_Mode::automatic ? "true" : "false") + "'",
+		"SET mysql-aws_blue_green_deployment_auto_discovery='" + auto_discovery + "'",
 		"UPDATE mysql_users SET default_hostgroup=" + to_string(hostgroups.blue_writer) +
 			" WHERE username='testuser'",
 	};
+
 	if (mode == BGD_Admin_Mode::explicit_configuration) {
-		queries.push_back(
+		string bgd_query =
 			"INSERT INTO mysql_aws_rds_bgd_hostgroups("
 			"writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup,"
 			"active,writer_is_also_reader,check_interval_ms,check_timeout_ms,comment) VALUES (" +
 			to_string(hostgroups.blue_writer) + "," + to_string(hostgroups.blue_reader) + "," +
 			to_string(hostgroups.green_writer) + "," + to_string(hostgroups.green_reader) +
-			",1,0,100,800,'BGD TAP explicit configuration')");
+			",1,0,100,800,'BGD TAP explicit configuration')";
+		queries.push_back(bgd_query);
 	}
-	if (execute_all(admin, queries) != EXIT_SUCCESS ||
-		bgd_admin_add_servers(admin, cluster, hostgroups, blue_hosts, false, blue_use_ssl) != EXIT_SUCCESS ||
-		bgd_admin_add_servers(admin, cluster, hostgroups, green_hosts, true, green_use_ssl) != EXIT_SUCCESS) {
+
+	int config_rc = execute_all(admin, queries);
+	if (config_rc != EXIT_SUCCESS) {
+		diag("Error: failed to configure ProxySQL BGD variables and hostgroups");
 		return EXIT_FAILURE;
 	}
-	return execute_all(admin, {
+
+	int blue_rc = bgd_admin_add_servers(admin, cluster, hostgroups, blue_hosts, false, blue_use_ssl);
+	if (blue_rc != EXIT_SUCCESS) {
+		diag("Error: failed to configure blue servers");
+		return EXIT_FAILURE;
+	}
+
+	int green_rc = bgd_admin_add_servers(admin, cluster, hostgroups, green_hosts, true, green_use_ssl);
+	if (green_rc != EXIT_SUCCESS) {
+		diag("Error: failed to configure green servers");
+		return EXIT_FAILURE;
+	}
+
+	vector<string> load_queries {
 		"LOAD MYSQL VARIABLES TO RUNTIME",
 		"LOAD MYSQL USERS TO RUNTIME",
 		"LOAD MYSQL SERVERS TO RUNTIME",
-	});
+	};
+	int load_rc = execute_all(admin, load_queries);
+	if (load_rc != EXIT_SUCCESS) {
+		diag("Error: failed to load ProxySQL BGD configuration to runtime");
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
 }
 
 inline rc_t<vector<mysql_res_row>> bgd_runtime_rows(MYSQL* admin, int writer_hostgroup) {
-	return mysql_query_ext_rows(
-		admin,
+	string query =
 		"SELECT writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup,"
 		"auto_generated,status FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=" +
-		to_string(writer_hostgroup));
+		to_string(writer_hostgroup);
+
+	rc_t<vector<mysql_res_row>> result = mysql_query_ext_rows(admin, query);
+	return result;
 }
 
-inline rc_t<vector<mysql_res_row>> bgd_runtime_servers(MYSQL* admin, const vector<int>& hostgroups) {
+inline rc_t<vector<mysql_res_row>> bgd_runtime_servers(MYSQL* admin, vector<int> hostgroups) {
 	string predicate {};
 	for (size_t i = 0; i < hostgroups.size(); ++i) {
-		if (i != 0) predicate += ",";
+		if (i != 0) {
+			predicate += ",";
+		}
 		predicate += to_string(hostgroups[i]);
 	}
-	return mysql_query_ext_rows(
-		admin,
+
+	string query =
 		"SELECT hostgroup_id,hostname,port,status,use_ssl FROM runtime_mysql_servers WHERE hostgroup_id IN (" +
-		predicate + ") ORDER BY hostgroup_id,hostname,port");
+		predicate + ") ORDER BY hostgroup_id,hostname,port";
+
+	rc_t<vector<mysql_res_row>> result = mysql_query_ext_rows(admin, query);
+	return result;
 }
 
-inline rc_t<int64_t> bgd_connection_pool_count(MYSQL* admin, int hostgroup, const string& hostname = "") {
-	string query {
+inline rc_t<int64_t> bgd_connection_pool_count(MYSQL* admin, int hostgroup, string hostname = "") {
+	string query =
 		"SELECT COALESCE(SUM(ConnUsed+ConnFree),0) FROM stats_mysql_connection_pool WHERE hostgroup=" +
-		to_string(hostgroup)
-	};
-	if (!hostname.empty()) query += " AND srv_host=" + bgd_sql_quote(hostname);
+		to_string(hostgroup);
+	if (!hostname.empty()) {
+		query += " AND srv_host=" + bgd_sql_quote(hostname);
+	}
+
 	auto [rc, rows] = mysql_query_ext_rows(admin, query);
-	if (rc != EXIT_SUCCESS || rows.size() != 1 || rows.front().size() != 1) return { EXIT_FAILURE, 0 };
-	return { EXIT_SUCCESS, strtoll(rows.front().front().c_str(), nullptr, 10) };
+	if (rc != EXIT_SUCCESS || rows.size() != 1 || rows[0].size() != 1) {
+		rc_t<int64_t> result { EXIT_FAILURE, 0 };
+		return result;
+	}
+
+	int64_t count = strtoll(rows[0][0].c_str(), nullptr, 10);
+	rc_t<int64_t> result { EXIT_SUCCESS, count };
+	return result;
 }
 
 inline rc_t<string> bgd_backend_ip_echo(MYSQL* proxy) {
-	auto [rc, rows] = mysql_query_ext_rows(proxy, "SELECT @@version_comment LIMIT 1");
-	if (rc != EXIT_SUCCESS || rows.size() != 1 || rows.front().size() != 1) return { EXIT_FAILURE, {} };
-	return { EXIT_SUCCESS, rows.front().front() };
-}
+	string query = "SELECT @@version_comment LIMIT 1";
 
-inline void bgd_dump_probe_log_since(RDS_BGD_Simulator& sim, uint64_t sequence) {
-	auto [rc, logs] = sim.probe_log_since(sequence);
-	if (rc != EXIT_SUCCESS) {
-		diag("Unable to read BGD probe diagnostics after sequence %llu", static_cast<unsigned long long>(sequence));
-		return;
+	auto [rc, rows] = mysql_query_ext_rows(proxy, query);
+	if (rc != EXIT_SUCCESS || rows.size() != 1 || rows[0].size() != 1) {
+		rc_t<string> result { EXIT_FAILURE, {} };
+		return result;
 	}
-	for (const RDS_BGD_Probe_Log& log : logs) {
-		diag("BGD probe sequence=%llu backend=%s:%d kind=%s encrypted=%d",
-			static_cast<unsigned long long>(log.sequence_id), log.backend.host.c_str(), log.backend.port,
-			log.probe_kind == RDS_BGD_Probe_Kind::table_check ? "table_check" : "metadata",
-			log.encrypted ? 1 : 0);
-	}
+
+	rc_t<string> result { EXIT_SUCCESS, rows[0][0] };
+	return result;
 }
 
 inline rc_t<uint64_t> bgd_probe_count_since(
-	RDS_BGD_Simulator& sim, uint64_t sequence, const Endpoint& backend, RDS_BGD_Probe_Kind kind)
+	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend, RDS_BGD_Probe_Kind kind)
 {
 	auto [rc, logs] = sim.probe_log_since(sequence);
-	if (rc != EXIT_SUCCESS) return { EXIT_FAILURE, 0 };
+	if (rc != EXIT_SUCCESS) {
+		rc_t<uint64_t> result { EXIT_FAILURE, 0 };
+		return result;
+	}
+
 	uint64_t count = 0;
 	for (const RDS_BGD_Probe_Log& log : logs) {
-		if (log.backend.host == backend.host && log.backend.port == backend.port && log.probe_kind == kind) ++count;
-	}
-	return { EXIT_SUCCESS, count };
-}
-
-inline void bgd_timeout_diagnostics(
-	MYSQL* admin, RDS_BGD_Simulator& sim, uint64_t sequence, const string& scenario,
-	const string& phase, const string& expected, int writer_hostgroup, const vector<int>& server_hostgroups)
-{
-	diag("BGD timeout scenario=%s phase=%s expected=%s", scenario.c_str(), phase.c_str(), expected.c_str());
-	auto [bgd_rc, bgd_rows] = bgd_runtime_rows(admin, writer_hostgroup);
-	if (bgd_rc == EXIT_SUCCESS) {
-		for (const mysql_res_row& row : bgd_rows) {
-			string values {};
-			for (size_t i = 0; i < row.size(); ++i) {
-				if (i != 0) values += ",";
-				values += row[i];
-			}
-			diag("runtime BGD row: %s", values.c_str());
+		bool backend_matches =
+			log.backend.host == backend.host &&
+			log.backend.port == backend.port;
+		bool kind_matches = log.probe_kind == kind;
+		if (backend_matches && kind_matches) {
+			++count;
 		}
 	}
-	auto [servers_rc, servers] = bgd_runtime_servers(admin, server_hostgroups);
-	if (servers_rc == EXIT_SUCCESS) {
-		for (const mysql_res_row& row : servers) {
-			if (row.size() == 5) diag("runtime server row: hg=%s host=%s port=%s status=%s ssl=%s",
-				row[0].c_str(), row[1].c_str(), row[2].c_str(), row[3].c_str(), row[4].c_str());
-		}
-	}
-	for (int hostgroup : server_hostgroups) {
-		auto [pool_rc, count] = bgd_connection_pool_count(admin, hostgroup);
-		if (pool_rc == EXIT_SUCCESS) diag("connection pool count hostgroup=%d count=%lld", hostgroup, static_cast<long long>(count));
-	}
-	bgd_dump_probe_log_since(sim, sequence);
+
+	rc_t<uint64_t> result { EXIT_SUCCESS, count };
+	return result;
 }
 
-inline int bgd_wait_for_condition(
-	MYSQL* admin, const string& query, uint32_t timeout_seconds, RDS_BGD_Simulator& sim,
-	uint64_t sequence, const string& scenario, const string& phase, const string& expected,
-	int writer_hostgroup, const vector<int>& server_hostgroups)
-{
+inline int bgd_wait_for_condition(MYSQL* admin, string query, uint32_t timeout_seconds) {
 	int rc = wait_for_cond(admin, query, timeout_seconds);
-	if (rc != EXIT_SUCCESS) {
-		bgd_timeout_diagnostics(admin, sim, sequence, scenario, phase, expected, writer_hostgroup, server_hostgroups);
-	}
+	return rc;
+}
+
+inline int bgd_wait_for_status(MYSQL* admin, BGD_Hostgroups& hostgroups, string status, uint32_t timeout_seconds) {
+	string query =
+		"SELECT COUNT(*)=1 FROM runtime_mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=" +
+		to_string(hostgroups.blue_writer) + " AND status=" + bgd_sql_quote(status);
+
+	int rc = bgd_wait_for_condition(admin, query, timeout_seconds);
+	return rc;
+}
+
+inline int bgd_wait_for_server_placement(
+	MYSQL* admin, int writer_hostgroup, int reader_hostgroup, RDS_BGD_Host& host,
+	bool in_reader_hostgroup, uint32_t timeout_seconds)
+{
+	string writer_count = in_reader_hostgroup ? "0" : "1";
+	string reader_count = in_reader_hostgroup ? "1" : "0";
+
+	string query = "SELECT "
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(writer_hostgroup) +
+		" AND hostname=" + bgd_sql_quote(host.hostname) + " AND port=" + to_string(host.port) + ")=" +
+		writer_count + " AND " +
+		"(SELECT COUNT(*) FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(reader_hostgroup) +
+		" AND hostname=" + bgd_sql_quote(host.hostname) + " AND port=" + to_string(host.port) + ")=" +
+		reader_count;
+
+	int rc = bgd_wait_for_condition(admin, query, timeout_seconds);
+	return rc;
+}
+
+// Temporary compatibility for unreviewed TAP files using the old diagnostic arguments.
+inline int bgd_wait_for_condition(
+	MYSQL* admin, string query, uint32_t timeout_seconds, RDS_BGD_Simulator&,
+	uint64_t, string, string, string, int, vector<int>)
+{
+	int rc = bgd_wait_for_condition(admin, query, timeout_seconds);
 	return rc;
 }
 
 inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe(
-	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend, RDS_BGD_Probe_Kind kind,
-	uint32_t timeout_ms, int encrypted, MYSQL* admin, const string& scenario, const string& phase,
-	int writer_hostgroup, const vector<int>& server_hostgroups)
+	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend,
+	RDS_BGD_Probe_Kind kind, uint32_t timeout_ms, int encrypted)
 {
-	auto [rc, probe] = sim.wait_for_probe_log(sequence, backend, kind, timeout_ms, encrypted);
-	if (rc != EXIT_SUCCESS) {
-		bgd_timeout_diagnostics(
-			admin, sim, sequence, scenario, phase,
-			"probe " + backend.host + ":" + to_string(backend.port), writer_hostgroup, server_hostgroups);
-	}
-	return { rc, probe };
+	rc_t<RDS_BGD_Probe_Log> result =
+		sim.wait_for_probe_log(sequence, backend, kind, timeout_ms, encrypted);
+	return result;
+}
+
+// Temporary compatibility for unreviewed TAP files using the old diagnostic arguments.
+inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe(
+	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend, RDS_BGD_Probe_Kind kind,
+	uint32_t timeout_ms, int encrypted, MYSQL*, string, string, int, vector<int>)
+{
+	rc_t<RDS_BGD_Probe_Log> result =
+		bgd_wait_for_probe(sim, sequence, backend, kind, timeout_ms, encrypted);
+	return result;
 }
 
 inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe_from_backends(
-	RDS_BGD_Simulator& sim, uint64_t sequence, const vector<Endpoint>& backends,
+	RDS_BGD_Simulator& sim, uint64_t sequence, vector<Endpoint> backends,
 	RDS_BGD_Probe_Kind kind, uint32_t timeout_ms, int encrypted = -1)
 {
-	const uint64_t deadline = monotonic_time() + static_cast<uint64_t>(timeout_ms) * 1000;
+	uint64_t deadline = monotonic_time() + static_cast<uint64_t>(timeout_ms) * 1000;
 	do {
 		auto [rc, logs] = sim.probe_log_since(sequence);
-		if (rc != EXIT_SUCCESS) return { EXIT_FAILURE, {} };
+		if (rc != EXIT_SUCCESS) {
+			rc_t<RDS_BGD_Probe_Log> result { EXIT_FAILURE, {} };
+			return result;
+		}
+
 		for (const RDS_BGD_Probe_Log& log : logs) {
 			for (const Endpoint& backend : backends) {
-				if (log.backend.host == backend.host && log.backend.port == backend.port && log.probe_kind == kind &&
-					(encrypted < 0 || log.encrypted == (encrypted != 0))) return { EXIT_SUCCESS, log };
+				bool backend_matches =
+					log.backend.host == backend.host &&
+					log.backend.port == backend.port;
+				bool kind_matches = log.probe_kind == kind;
+				bool encryption_matches =
+					encrypted < 0 ||
+					log.encrypted == (encrypted != 0);
+				if (backend_matches && kind_matches && encryption_matches) {
+					rc_t<RDS_BGD_Probe_Log> result { EXIT_SUCCESS, log };
+					return result;
+				}
 			}
 		}
+
 		usleep(50000);
 	} while (monotonic_time() < deadline);
-	return { ETIMEDOUT, {} };
+
+	rc_t<RDS_BGD_Probe_Log> result { ETIMEDOUT, {} };
+	return result;
+}
+
+/**
+ * Verify that a configuration change does not restart BGD discovery.
+ *
+ * The expected result is ETIMEDOUT because no table-check probe should appear
+ * after the given sequence.
+ */
+inline int bgd_expect_no_table_check(
+	RDS_BGD_Simulator& sim, uint64_t sequence, vector<Endpoint> backends, uint32_t timeout_ms)
+{
+	auto [probe_rc, probe] = bgd_wait_for_probe_from_backends(
+		sim, sequence, backends, RDS_BGD_Probe_Kind::table_check, timeout_ms
+	);
+
+	if (probe_rc == ETIMEDOUT) {
+		return EXIT_SUCCESS;
+	}
+	return EXIT_FAILURE;
+}
+
+/**
+ * Verify that one endpoint does not receive metadata probes.
+ *
+ * The expected result is ETIMEDOUT because no metadata probe should reach the
+ * endpoint after the given sequence.
+ */
+inline int bgd_expect_no_metadata_probe(
+	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend, uint32_t timeout_ms)
+{
+	vector<Endpoint> backends { backend };
+
+	auto [probe_rc, probe] = bgd_wait_for_probe_from_backends(
+		sim, sequence, backends, RDS_BGD_Probe_Kind::metadata, timeout_ms
+	);
+
+	if (probe_rc == ETIMEDOUT) {
+		return EXIT_SUCCESS;
+	}
+	return EXIT_FAILURE;
+}
+
+/**
+ * Verify that none of the supplied endpoints receives a metadata probe.
+ *
+ * The expected result is ETIMEDOUT because no metadata probe should reach any
+ * endpoint after the given sequence.
+ */
+inline int bgd_expect_no_metadata_probe_from_backends(
+	RDS_BGD_Simulator& sim, uint64_t sequence, vector<Endpoint> backends, uint32_t timeout_ms)
+{
+	auto [probe_rc, probe] = bgd_wait_for_probe_from_backends(
+		sim, sequence, backends, RDS_BGD_Probe_Kind::metadata, timeout_ms
+	);
+
+	if (probe_rc == ETIMEDOUT) {
+		return EXIT_SUCCESS;
+	}
+	return EXIT_FAILURE;
 }
 
 inline int execute_all(MYSQL* admin, vector<string> queries) {
 	for (string& query : queries) {
 		if (mysql_query(admin, query.c_str()) != 0) {
-			diag("Admin query failed (%u): %s; query: %s", mysql_errno(admin), mysql_error(admin), query.c_str());
+			diag("Error: Admin query failed (%u): %s; query: %s",
+				mysql_errno(admin), mysql_error(admin), query.c_str());
 			return EXIT_FAILURE;
 		}
 	}
