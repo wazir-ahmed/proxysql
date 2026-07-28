@@ -413,24 +413,12 @@ MYSQL * MySQL_Monitor_Connection_Pool::get_connection(char *hostname, int port, 
 					}
 				}
 #endif // DEBUG
+				std::vector<MYSQL*> skipped_conn;
 				while (srv->conns->len) {
 					unsigned int idx = rand() % srv->conns->len;
 					MYSQL* mysql = (MYSQL*)srv->conns->remove_index_fast(idx);
 
 					if (!mysql) continue;
-
-					// The pool is grouped by hostname and port, but the same server can
-					// be reconfigured between plaintext and TLS. Never reuse a connection
-					// whose transport no longer matches the requesting monitor task.
-					bool connection_uses_ssl = mysql->options.use_ssl != 0;
-					if (mmsd && connection_uses_ssl != mmsd->use_ssl) {
-						MySQL_Monitor_State_Data* close_mmsd =
-							new MySQL_Monitor_State_Data(MON_CLOSE_CONNECTION, (char*)"", 0, false);
-						close_mmsd->mysql = mysql;
-						GloMyMon->queue->add(
-							new WorkItem<MySQL_Monitor_State_Data>(close_mmsd, NULL));
-						continue;
-					}
 
 					// close connection if not used for a while
 					unsigned long long then = *(unsigned long long*)mysql->net.buff;
@@ -441,8 +429,22 @@ MYSQL * MySQL_Monitor_Connection_Pool::get_connection(char *hostname, int port, 
 						continue;
 					}
 
+					// The pool is grouped by hostname and port, but the same server can
+					// be monitored over plaintext and TLS. Keep connections that may
+					// match another monitor task and continue searching for this one.
+					bool connection_uses_ssl = mysql->options.use_ssl != 0;
+					if (mmsd && connection_uses_ssl != mmsd->use_ssl) {
+						skipped_conn.push_back(mysql);
+						continue;
+					}
+
 					my = mysql;
 					break;
+				}
+
+				// Return skipped connections to the pool
+				for (MYSQL* mysql : skipped_conn) {
+					srv->conns->add(mysql);
 				}
 #ifdef DEBUG
 				// 'my' can be NULL due to connection cleanup, and can cause crash
