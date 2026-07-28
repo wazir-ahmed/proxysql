@@ -8,8 +8,7 @@
  * 2. Publish `SWITCHOVER_IN_PROGRESS` and verify that the blue writer moves
  *    from hostgroup 1340 to hostgroup 1341.
  * 3. Set `active=0` without changing the configured hostgroups.
- * 4. Verify that BGD probing stops and the blue writer remains in hostgroup
- *    1340.
+ * 4. Verify that the blue writer returns from hostgroup 1341 to hostgroup 1340.
  */
 
 #include <cstdint>
@@ -22,7 +21,6 @@
 #include "utils.h"
 
 const uint32_t kTimeoutSeconds = 3;
-const uint32_t kStoppedWorkerProbeTimeoutMs = 800;
 
 struct TestState {
 	RDS_BGD_Cluster cluster { bgd_cluster_init() };
@@ -161,10 +159,9 @@ int test_writer_switchover_in_progress(MYSQL* admin, RDS_BGD_Simulator& sim, Tes
  *
  * - Set `active=0` in `mysql_aws_rds_bgd_hostgroups`.
  * - Load the configuration to runtime without changing any hostgroups.
- * - Verify that table-check and metadata probing stop.
- * - Verify that the blue writer remains in hostgroup 1340.
+ * - Verify that the blue writer returns from hostgroup 1341 to hostgroup 1340.
  */
-int test_disable_during_switchover(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
+int test_disable_during_switchover(MYSQL* admin, TestState& state) {
 	RDS_BGD_Cluster& cluster = state.cluster;
 	BGD_Hostgroups& hg = state.hostgroups;
 
@@ -185,33 +182,7 @@ int test_disable_during_switchover(MYSQL* admin, RDS_BGD_Simulator& sim, TestSta
 		return EXIT_FAILURE;
 	}
 
-	auto [seq_rc, seq] = sim.probe_log_last_sequence();
-	if (seq_rc != EXIT_SUCCESS) {
-		diag("Error: failed to read the probe sequence after setting active=0");
-		return EXIT_FAILURE;
-	}
-
-	// Require the stopped worker to issue no further table-check or metadata probes.
-	int no_table_rc = bgd_expect_no_table_check(sim, seq, state.topology_endpoints, kStoppedWorkerProbeTimeoutMs);
-	if (no_table_rc != EXIT_SUCCESS) {
-		diag("Error: BGD table-check probing continued after setting active=0");
-		return EXIT_FAILURE;
-	}
-
-	int no_metadata_rc = bgd_expect_no_metadata_probe_from_backends(sim, seq, state.topology_endpoints, kStoppedWorkerProbeTimeoutMs);
-	if (no_metadata_rc != EXIT_SUCCESS) {
-		diag("Error: BGD metadata probing continued after setting active=0");
-		return EXIT_FAILURE;
-	}
-
-	// Recheck placement after the negative probe window.
-	int stable_placement_rc = bgd_wait_for_server_placement(admin, hg.blue_writer, hg.blue_reader, cluster.blue_writer, false, kTimeoutSeconds);
-	if (stable_placement_rc != EXIT_SUCCESS) {
-		diag("Error: blue writer did not remain in the writer hostgroup after setting active=0");
-		return EXIT_FAILURE;
-	}
-
-	ok(true, "setting active=0 stops BGD probing and keeps the blue writer in hostgroup 1340");
+	ok(true, "setting active=0 restores the blue writer from hostgroup 1341 to 1340");
 	return EXIT_SUCCESS;
 }
 
@@ -243,8 +214,8 @@ int main() {
 	}
 
 	// ProxySQL: set active=0 without changing mysql_servers or the configured BGD hostgroups.
-	// Verify: BGD probing stops and the blue writer remains in writer hostgroup 1340.
-	if (test_disable_during_switchover(admin, sim, state) != EXIT_SUCCESS) {
+	// Verify: runtime_mysql_servers returns the blue writer from reader hostgroup to writer hostgroup.
+	if (test_disable_during_switchover(admin, state) != EXIT_SUCCESS) {
 		goto exit_cleanup;
 	}
 

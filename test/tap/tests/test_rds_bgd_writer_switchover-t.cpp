@@ -7,9 +7,10 @@
  * 1. Configure BGD hostgroups 970-973 and reach AVAILABLE.
  * 2. Publish SWITCHOVER_INITIATED and verify read-only placement suppression.
  * 3. Publish SWITCHOVER_IN_PROGRESS and verify blue-writer demotion.
- * 4. Publish SWITCHOVER_IN_POST_PROCESSING and verify writer restoration,
- *    old blue-pool drain, and green backend routing.
- * 5. Create a post-cutover pool and verify repeated POST_PROCESSING does not
+ * 4. Create a blue-writer pool through normal routing hostgroup 974.
+ * 5. Publish SWITCHOVER_IN_POST_PROCESSING and verify writer restoration,
+ *    blue-pool drain, and green backend routing.
+ * 6. Create a post-cutover pool and verify repeated POST_PROCESSING does not
  *    drain it again.
  */
 
@@ -29,6 +30,7 @@ const uint32_t kReadOnlyObservationMs = 500;
 struct TestState {
 	RDS_BGD_Cluster cluster { bgd_cluster_init() };
 	BGD_Hostgroups hostgroups { 970, 971, 972, 973 };
+	int pool_hostgroup { 974 };
 	vector<Endpoint> topology_endpoints { cluster.get_endpoints() };
 	int64_t reader_log_baseline { -1 };
 };
@@ -147,15 +149,69 @@ rc_t<string> connect_and_echo(CommandLine& cl) {
 	return result;
 }
 
+int set_default_hostgroup(MYSQL* admin, int hostgroup) {
+	vector<string> queries {
+		"UPDATE mysql_users SET default_hostgroup=" + to_string(hostgroup) + " WHERE username='testuser'",
+		"LOAD MYSQL USERS TO RUNTIME",
+	};
+
+	int rc = execute_all(admin, queries);
+	return rc;
+}
+
+int create_blue_writer_pool(CommandLine& cl, MYSQL* admin, TestState& state) {
+	RDS_BGD_Cluster& cluster = state.cluster;
+
+	string add_server =
+		"INSERT INTO mysql_servers(hostgroup_id,hostname,port,status,comment) VALUES (" +
+		to_string(state.pool_hostgroup) + "," + bgd_sql_quote(cluster.blue_writer.hostname) +
+		"," + to_string(cluster.blue_writer.port) + ",'ONLINE','BGD TAP blue pool router')";
+	vector<string> queries {
+		add_server,
+		"LOAD MYSQL SERVERS TO RUNTIME",
+	};
+
+	int server_rc = execute_all(admin, queries);
+	if (server_rc != EXIT_SUCCESS) {
+		diag("Error: failed to configure blue-pool routing hostgroup 974");
+		return EXIT_FAILURE;
+	}
+
+	int user_rc = set_default_hostgroup(admin, state.pool_hostgroup);
+	if (user_rc != EXIT_SUCCESS) {
+		diag("Error: failed to route testuser through blue-pool hostgroup 974");
+		return EXIT_FAILURE;
+	}
+
+	auto [echo_rc, echo] = connect_and_echo(cl);
+	if (echo_rc != EXIT_SUCCESS || echo.find(cluster.blue_writer.ip) == string::npos) {
+		diag("Error: failed to create a blue-writer connection through hostgroup 974");
+		return EXIT_FAILURE;
+	}
+
+	int restore_rc = set_default_hostgroup(admin, state.hostgroups.blue_writer);
+	if (restore_rc != EXIT_SUCCESS) {
+		diag("Error: failed to restore testuser to writer hostgroup 970");
+		return EXIT_FAILURE;
+	}
+
+	string query =
+		"SELECT COALESCE(SUM(ConnUsed+ConnFree),0)>=1 FROM stats_mysql_connection_pool WHERE hostgroup=" +
+		to_string(state.pool_hostgroup) + " AND srv_host=" + bgd_sql_quote(cluster.blue_writer.hostname);
+
+	int pool_rc = bgd_wait_for_condition(admin, query, kTimeoutSeconds);
+	return pool_rc;
+}
+
 /**
  * Configure wHG 970 and reach AVAILABLE.
  *
  * - Set writer read_only=0 and reader read_only=1 values.
  * - Publish AVAILABLE topology with one reader pair.
  * - Configure mysql_servers and mysql_aws_rds_bgd_hostgroups.
- * - Verify BGD status AVAILABLE and establish a blue-writer pool.
+ * - Verify BGD status AVAILABLE.
  */
-int test_bgd_status_available(CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
+int test_bgd_status_available(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
 	RDS_BGD_Cluster& cluster = state.cluster;
 	BGD_Hostgroups& hg = state.hostgroups;
 
@@ -201,12 +257,6 @@ int test_bgd_status_available(CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& 
 	int status_rc = bgd_wait_for_status(admin, hg, "AVAILABLE", kTimeoutSeconds);
 	if (status_rc != EXIT_SUCCESS) {
 		diag("Error: BGD status for wHG 970 did not reach AVAILABLE");
-		return EXIT_FAILURE;
-	}
-
-	auto [echo_rc, echo] = connect_and_echo(cl);
-	if (echo_rc != EXIT_SUCCESS || echo.find(cluster.blue_writer.ip) == string::npos) {
-		diag("Error: failed to establish the pre-switchover blue-writer pool");
 		return EXIT_FAILURE;
 	}
 
@@ -356,6 +406,7 @@ int test_switchover_in_progress(MYSQL* admin, RDS_BGD_Simulator& sim, TestState&
 /**
  * Enter writer switchover post-processing.
  *
+ * - Create a blue-writer pool through normal routing hostgroup 974.
  * - Publish SWITCHOVER_IN_POST_PROCESSING.
  * - Verify WRITER_SWITCHOVER_POST_PROCESSING.
  * - Verify writer restoration, blue-pool drain, and green backend routing.
@@ -365,9 +416,9 @@ int test_switchover_post_processing(CommandLine& cl, MYSQL* admin, RDS_BGD_Simul
 	RDS_BGD_Cluster& cluster = state.cluster;
 	BGD_Hostgroups& hg = state.hostgroups;
 
-	auto [blue_pool_rc, blue_pool] = bgd_connection_pool_count(admin, hg.blue_writer, cluster.blue_writer.hostname);
-	if (blue_pool_rc != EXIT_SUCCESS || blue_pool < 1) {
-		diag("Error: blue-writer pool is empty before SWITCHOVER_IN_POST_PROCESSING");
+	int blue_pool_rc = create_blue_writer_pool(cl, admin, state);
+	if (blue_pool_rc != EXIT_SUCCESS) {
+		diag("Error: failed to establish the blue-writer pool before SWITCHOVER_IN_POST_PROCESSING");
 		return EXIT_FAILURE;
 	}
 
@@ -470,9 +521,9 @@ int main() {
 	TestState state {};
 
 	// Simulator: set writer/reader read_only values and publish AVAILABLE topology.
-	// ProxySQL: configure BGD hostgroups 970-973 and establish a blue-writer pool.
+	// ProxySQL: configure BGD hostgroups 970-973.
 	// Verify: BGD status for wHG 970 reports AVAILABLE.
-	if (test_bgd_status_available(cl, admin, sim, state) != EXIT_SUCCESS) {
+	if (test_bgd_status_available(admin, sim, state) != EXIT_SUCCESS) {
 		goto exit_cleanup;
 	}
 
@@ -490,6 +541,7 @@ int main() {
 		goto exit_cleanup;
 	}
 
+	// ProxySQL: create a blue-writer pool through normal routing hostgroup 974.
 	// Simulator: publish SWITCHOVER_IN_POST_PROCESSING twice.
 	// Verify: writer placement is restored, the old pool drains, and routing reaches the green IP.
 	// Verify: repeated POST_PROCESSING preserves a connection created after cutover.

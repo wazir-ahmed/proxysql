@@ -7115,6 +7115,9 @@ __exit_monitor_RDS_BGD_thread_HG_now:
 	}
 
 	if (mmsd) {
+		if (mmsd->mysql) {
+			GloMyMon->My_Conn_Pool->destroy_mysql_connection(mmsd);
+		}
 		delete mmsd;
 		mmsd = NULL;
 	}
@@ -7207,18 +7210,21 @@ void MySQL_Monitor::aws_rds_bgd_build_map(AWS_RDS_BGD_State& st, AWS_RDS_Topolog
 
 				// read the green writer's use_ssl config
 				if (st.green_writer_hg >= 0) {
+					p.green_eligible = false;
 					MyHGC* gwhgc = MyHGM->MyHGC_find((unsigned int)st.green_writer_hg);
 					if (gwhgc && gwhgc->mysrvs) {
 						for (unsigned int k = 0; k < gwhgc->mysrvs->cnt(); k++) {
 							MySrvC* gs = gwhgc->mysrvs->idx(k);
-							if (gs->get_status() == MYSQL_SERVER_STATUS_OFFLINE_HARD
-								|| gs->get_status() == MYSQL_SERVER_STATUS_OFFLINE_SOFT) {
+							if (strcasecmp(gs->address, green_writer_host.c_str()) != 0 || gs->port != p.port) {
 								continue;
 							}
-							if (strcasecmp(gs->address, green_writer_host.c_str()) == 0 && gs->port == p.port) {
+
+							if (gs->get_status() != MYSQL_SERVER_STATUS_OFFLINE_HARD
+								&& gs->get_status() != MYSQL_SERVER_STATUS_OFFLINE_SOFT) {
 								p.green_use_ssl = gs->use_ssl;
-								break;
+								p.green_eligible = true;
 							}
+							break;
 						}
 					}
 				}
@@ -7293,6 +7299,10 @@ void MySQL_Monitor::aws_rds_bgd_build_map(AWS_RDS_BGD_State& st, AWS_RDS_Topolog
 void MySQL_Monitor::aws_rds_bgd_resolve_green_ips(AWS_RDS_BGD_State& st) {
 	int ai_family = mysql_resolution_family_to_ai_family(mysql_thread___resolution_family);
 	for (auto &p : st.bg_map) {
+		if (!p.green_eligible) {
+			continue;
+		}
+
 		// Always check the cache first: a green host that is a monitored server may be there.
 		size_t n = 0;
 		std::string ip = MySQL_Monitor::dns_lookup(p.green_host, false, &n);
@@ -7321,7 +7331,7 @@ void MySQL_Monitor::aws_rds_bgd_resolve_green_ips(AWS_RDS_BGD_State& st) {
 
 	// Pin the worker's next probe to the green writer's IP (observe the switchover from green).
 	for (const AWS_RDS_BlueGreenPair& p : st.bg_map) {
-		if (p.is_writer && !p.green_ip.empty()) {
+		if (p.is_writer && p.green_eligible && !p.green_ip.empty()) {
 			if (st.next_check_host != p.green_ip) {
 				st.next_check_host = p.green_ip;
 				proxy_info("AWS RDS BGD [wHG=%u rHG=%u]: pinning rds_topology probe to green IP %s\n",
@@ -7354,6 +7364,7 @@ void MySQL_Monitor::aws_rds_bgd_add_green_writer_in_hg(AWS_RDS_BGD_State& st) {
 			MySrvC* s = MyHGM->find_server_in_hg((unsigned int)st.green_writer_hg, p.green_host, p.port);
 			if (s) {
 				p.green_use_ssl = s->use_ssl;
+				p.green_eligible = true;
 			}
 			MyHGM->publish_mysql_servers_to_runtime();
 		}
@@ -7780,9 +7791,7 @@ void MySQL_Monitor::aws_rds_bgd_hostgroup_action(
 		changed |= MyHGM->aws_rds_bgd_configure_writer(writer.host.c_str(), writer.port, writer_is_also_reader);
 		shun_readers = true;
 	} else if (bgd_status == AWS_RDS_BGD_Status::SWITCHOVER_COMPLETED) {
-		if (!writer_is_also_reader) {
-			changed |= (MyHGM->remove_server_in_hg(reader_hg, writer.host, writer.port) == 0);
-		}
+		changed |= MyHGM->aws_rds_bgd_configure_writer(writer.host.c_str(), writer.port, writer_is_also_reader);
 	} else {
 		MyHGM->wrunlock();
 		return;

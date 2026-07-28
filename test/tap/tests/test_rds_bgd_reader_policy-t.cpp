@@ -6,7 +6,8 @@
  *
  * 1. Publish SWITCHOVER_IN_POST_PROCESSING with one mapped and one unmapped
  *    blue reader.
- * 2. Verify that only the mapped blue reader remains ONLINE.
+ * 2. Verify that the mapped blue reader remains ONLINE and reader traffic
+ *    reaches its green target instead of the unmapped blue reader.
  * 3. Publish SWITCHOVER_IN_POST_PROCESSING without reader pairs while both
  *    blue readers are OFFLINE_SOFT or OFFLINE_HARD, then verify that they do
  *    not trigger writer fallback.
@@ -116,7 +117,9 @@ int configure_read_only_values(RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster)
 	return EXIT_SUCCESS;
 }
 
-int configure_bgd(MYSQL* admin, RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster, BGD_Hostgroups& hg) {
+int configure_bgd(
+	MYSQL* admin, RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster, BGD_Hostgroups& hg, size_t green_reader_count)
+{
 	int read_only_rc = configure_read_only_values(sim, cluster);
 	if (read_only_rc != EXIT_SUCCESS) {
 		diag("Error: failed to configure simulated read_only values for wHG %d", hg.blue_writer);
@@ -124,7 +127,11 @@ int configure_bgd(MYSQL* admin, RDS_BGD_Simulator& sim, RDS_BGD_Cluster& cluster
 	}
 
 	vector<RDS_BGD_Host> blue_servers { cluster.blue_writer, cluster.blue_readers[0], cluster.blue_readers[1] };
-	vector<RDS_BGD_Host> green_servers { cluster.green_writer, cluster.green_readers[0], cluster.green_readers[1] };
+	vector<RDS_BGD_Host> green_servers { cluster.green_writer };
+	for (size_t i = 0; i < green_reader_count; ++i) {
+		green_servers.push_back(cluster.green_readers[i]);
+	}
+
 	int admin_rc = bgd_admin_setup(
 		admin, cluster, hg, BGD_Admin_Mode::explicit_configuration, blue_servers, green_servers, 0, 0
 	);
@@ -146,10 +153,9 @@ int publish_post_processing(
 	return rc;
 }
 
-int wait_for_reader_online_count(MYSQL* admin, BGD_Hostgroups& hg, RDS_BGD_Host& host, int expected) {
+int wait_for_reader_online(MYSQL* admin, BGD_Hostgroups& hg, RDS_BGD_Host& host) {
 	string query =
-		"SELECT COUNT(*)=" + to_string(expected) +
-		" FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hg.blue_reader) +
+		"SELECT COUNT(*)=1 FROM runtime_mysql_servers WHERE hostgroup_id=" + to_string(hg.blue_reader) +
 		" AND hostname=" + bgd_sql_quote(host.hostname) + " AND port=" + to_string(host.port) +
 		" AND status='ONLINE'";
 
@@ -219,16 +225,36 @@ rc_t<string> connect_and_echo(CommandLine& cl) {
  * - Configure blue readers 0 and 1 in hostgroup 1281.
  * - Publish SWITCHOVER_IN_POST_PROCESSING topology with a pair only for blue
  *   reader 0.
- * - Verify that the mapped reader remains ONLINE and the unmapped reader is
- *   excluded from ONLINE routing.
+ * - Verify that the mapped reader remains ONLINE.
+ * - Route a client through hostgroup 1281 and verify that it reaches the
+ *   mapped green reader instead of the unmapped blue reader.
  */
-int test_matched_unmatched_readers(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
+int test_matched_unmatched_readers(CommandLine& cl, MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
 	RDS_BGD_Cluster& cluster = state.matched;
 	BGD_Hostgroups& hg = state.matched_hg;
 
-	int config_rc = configure_bgd(admin, sim, cluster, hg);
+	int config_rc = configure_bgd(admin, sim, cluster, hg, 1);
 	if (config_rc != EXIT_SUCCESS) {
 		diag("Error: failed to configure matched-reader scenario for wHG 1280");
+		return EXIT_FAILURE;
+	}
+
+	// Prefer the unmapped reader heavily so a routing check fails if BGD leaves it eligible.
+	string mapped_weight =
+		"UPDATE mysql_servers SET weight=1 WHERE hostgroup_id=" + to_string(hg.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[0].hostname);
+	string unmapped_weight =
+		"UPDATE mysql_servers SET weight=1000000 WHERE hostgroup_id=" + to_string(hg.blue_reader) +
+		" AND hostname=" + bgd_sql_quote(cluster.blue_readers[1].hostname);
+	vector<string> weight_queries {
+		mapped_weight,
+		unmapped_weight,
+		"LOAD MYSQL SERVERS TO RUNTIME",
+	};
+
+	int weight_rc = execute_all(admin, weight_queries);
+	if (weight_rc != EXIT_SUCCESS) {
+		diag("Error: failed to configure deterministic reader weights in hostgroup 1281");
 		return EXIT_FAILURE;
 	}
 
@@ -244,7 +270,7 @@ int test_matched_unmatched_readers(MYSQL* admin, RDS_BGD_Simulator& sim, TestSta
 		return EXIT_FAILURE;
 	}
 
-	int matched_rc = wait_for_reader_online_count(admin, hg, cluster.blue_readers[0], 1);
+	int matched_rc = wait_for_reader_online(admin, hg, cluster.blue_readers[0]);
 	if (matched_rc != EXIT_SUCCESS) {
 		diag("Error: mapped blue reader did not remain ONLINE in hostgroup 1281");
 		return EXIT_FAILURE;
@@ -252,13 +278,20 @@ int test_matched_unmatched_readers(MYSQL* admin, RDS_BGD_Simulator& sim, TestSta
 
 	ok(true, "SWITCHOVER_IN_POST_PROCESSING keeps the mapped blue reader ONLINE in hostgroup 1281");
 
-	int unmatched_rc = wait_for_reader_online_count(admin, hg, cluster.blue_readers[1], 0);
-	if (unmatched_rc != EXIT_SUCCESS) {
-		diag("Error: unmapped blue reader remained ONLINE in hostgroup 1281");
+	int user_rc = set_default_hostgroup(admin, hg.blue_reader);
+	if (user_rc != EXIT_SUCCESS) {
+		diag("Error: failed to route testuser through reader hostgroup 1281");
 		return EXIT_FAILURE;
 	}
 
-	ok(true, "SWITCHOVER_IN_POST_PROCESSING excludes the unmapped blue reader from ONLINE routing in hostgroup 1281");
+	auto [echo_rc, echo] = connect_and_echo(cl);
+	if (echo_rc != EXIT_SUCCESS) {
+		diag("Error: failed to connect through reader hostgroup 1281");
+		return EXIT_FAILURE;
+	}
+
+	bool mapped_reader_routing = echo.find(cluster.green_readers[0].ip) != string::npos;
+	ok(mapped_reader_routing, "SWITCHOVER_IN_POST_PROCESSING routes hostgroup 1281 through the mapped green reader");
 	return EXIT_SUCCESS;
 }
 
@@ -274,7 +307,7 @@ int test_offline_blue_servers(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& s
 	RDS_BGD_Cluster& cluster = state.fallback;
 	BGD_Hostgroups& hg = state.fallback_hg;
 
-	int config_rc = configure_bgd(admin, sim, cluster, hg);
+	int config_rc = configure_bgd(admin, sim, cluster, hg, 0);
 	if (config_rc != EXIT_SUCCESS) {
 		diag("Error: failed to configure offline-reader scenario for wHG 1290");
 		return EXIT_FAILURE;
@@ -371,7 +404,7 @@ int main() {
 
 	// Simulator: publish SWITCHOVER_IN_POST_PROCESSING with one reader pair for wHG 1280.
 	// Verify: only the mapped blue reader remains ONLINE in reader hostgroup 1281.
-	if (test_matched_unmatched_readers(admin, sim, state) != EXIT_SUCCESS) {
+	if (test_matched_unmatched_readers(cl, admin, sim, state) != EXIT_SUCCESS) {
 		goto exit_cleanup;
 	}
 

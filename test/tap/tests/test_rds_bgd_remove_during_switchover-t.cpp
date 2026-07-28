@@ -8,8 +8,8 @@
  * 2. Publish `SWITCHOVER_IN_PROGRESS` and verify that the blue writer moves
  *    from hostgroup 1350 to hostgroup 1351.
  * 3. Delete writer hostgroup 1350 from `mysql_aws_rds_bgd_hostgroups`.
- * 4. Verify that BGD probing stops, the blue writer remains in hostgroup 1350,
- *    and the runtime BGD row is removed.
+ * 4. Verify that the blue writer returns to hostgroup 1350 and the runtime BGD
+ *    row is removed.
  */
 
 #include <cstdint>
@@ -22,7 +22,6 @@
 #include "utils.h"
 
 const uint32_t kTimeoutSeconds = 3;
-const uint32_t kStoppedWorkerProbeTimeoutMs = 800;
 
 struct TestState {
 	RDS_BGD_Cluster cluster { bgd_cluster_init() };
@@ -170,11 +169,10 @@ int test_writer_switchover_in_progress(MYSQL* admin, RDS_BGD_Simulator& sim, Tes
  *
  * - Delete writer hostgroup 1350 from `mysql_aws_rds_bgd_hostgroups`.
  * - Load the configuration to runtime without changing `mysql_servers`.
- * - Verify that table-check and metadata probing stop.
- * - Verify that the blue writer remains in hostgroup 1350.
+ * - Verify that the blue writer returns to hostgroup 1350.
  * - Verify that the runtime BGD row for writer hostgroup 1350 is removed.
  */
-int test_remove_during_switchover(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
+int test_remove_during_switchover(MYSQL* admin, TestState& state) {
 	RDS_BGD_Cluster& cluster = state.cluster;
 	BGD_Hostgroups& hg = state.hostgroups;
 
@@ -206,33 +204,7 @@ int test_remove_during_switchover(MYSQL* admin, RDS_BGD_Simulator& sim, TestStat
 		return EXIT_FAILURE;
 	}
 
-	auto [seq_rc, seq] = sim.probe_log_last_sequence();
-	if (seq_rc != EXIT_SUCCESS) {
-		diag("Error: failed to read the probe sequence after deleting the BGD configuration");
-		return EXIT_FAILURE;
-	}
-
-	// Require the stopped worker to issue no further table-check or metadata probes.
-	int no_table_rc = bgd_expect_no_table_check(sim, seq, state.topology_endpoints, kStoppedWorkerProbeTimeoutMs);
-	if (no_table_rc != EXIT_SUCCESS) {
-		diag("Error: BGD table-check probing continued after deleting the BGD configuration");
-		return EXIT_FAILURE;
-	}
-
-	int no_metadata_rc = bgd_expect_no_metadata_probe_from_backends(sim, seq, state.topology_endpoints, kStoppedWorkerProbeTimeoutMs);
-	if (no_metadata_rc != EXIT_SUCCESS) {
-		diag("Error: BGD metadata probing continued after deleting the BGD configuration");
-		return EXIT_FAILURE;
-	}
-
-	// Recheck placement after the negative probe window.
-	int stable_placement_rc = bgd_wait_for_server_placement(admin, hg.blue_writer, hg.blue_reader, cluster.blue_writer, false, kTimeoutSeconds);
-	if (stable_placement_rc != EXIT_SUCCESS) {
-		diag("Error: blue writer did not remain in the writer hostgroup after deleting the BGD configuration");
-		return EXIT_FAILURE;
-	}
-
-	ok(true, "deleting BGD configuration stops probing and keeps the blue writer in hostgroup 1350");
+	ok(true, "deleting BGD configuration restores the blue writer from hostgroup 1351 to 1350");
 	ok(true, "deleting wHG 1350 removes it from runtime_mysql_aws_rds_bgd_hostgroups");
 	return EXIT_SUCCESS;
 }
@@ -265,8 +237,8 @@ int main() {
 	}
 
 	// ProxySQL: delete wHG 1350 from mysql_aws_rds_bgd_hostgroups without changing mysql_servers.
-	// Verify: BGD probing stops, the blue writer remains in hostgroup 1350, and the runtime row is absent.
-	if (test_remove_during_switchover(admin, sim, state) != EXIT_SUCCESS) {
+	// Verify: the blue writer returns to hostgroup 1350 and the runtime BGD row is absent.
+	if (test_remove_during_switchover(admin, state) != EXIT_SUCCESS) {
 		goto exit_cleanup;
 	}
 

@@ -27,14 +27,16 @@ const uint32_t kTimeoutSeconds = 3;
 const uint32_t kProbeTimeoutMs = 3000;
 const uint32_t kNegativeProbeTimeoutMs = 800;
 const uint32_t kRefreshedCheckIntervalMs = 1000;
-const uint32_t kEarlyProbeTimeoutMs = 500;
-const uint32_t kNextProbeTimeoutMs = 1000;
+const uint32_t kMinimumProbeIntervalMs = 500;
+const uint32_t kMaximumProbeIntervalMs = 1500;
 
 struct TestState {
 	RDS_BGD_Cluster cluster { bgd_cluster_2_init() };
 	BGD_Hostgroups hostgroups { 1370, 1371, 1372, 1373 };
 	vector<Endpoint> topology_endpoints { cluster.get_endpoints() };
 	uint64_t available_probe_sequence { 0 };
+	string topology_discovery_interval {};
+	bool topology_discovery_interval_saved { false };
 };
 
 int setup(CommandLine& cl, MYSQL*& admin, RDS_BGD_Simulator& sim) {
@@ -59,10 +61,29 @@ int setup(CommandLine& cl, MYSQL*& admin, RDS_BGD_Simulator& sim) {
 	return EXIT_SUCCESS;
 }
 
-int cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
+int restore_topology_discovery_interval(MYSQL* admin, TestState& state) {
+	if (!state.topology_discovery_interval_saved) {
+		return EXIT_SUCCESS;
+	}
+
+	vector<string> queries {
+		"SET mysql-monitor_aws_rds_topology_discovery_interval=" + state.topology_discovery_interval,
+		"LOAD MYSQL VARIABLES TO RUNTIME",
+	};
+
+	int rc = execute_all(admin, queries);
+	return rc;
+}
+
+int cleanup(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
 	int admin_rc = bgd_admin_cleanup(admin);
 	if (admin_rc != EXIT_SUCCESS) {
 		diag("Error: failed to clean ProxySQL BGD test state");
+	}
+
+	int discovery_rc = restore_topology_discovery_interval(admin, state);
+	if (discovery_rc != EXIT_SUCCESS) {
+		diag("Error: failed to restore mysql-monitor_aws_rds_topology_discovery_interval");
 	}
 	mysql_close(admin);
 
@@ -71,7 +92,34 @@ int cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
 		diag("Error: failed to clean SQLite3-server simulator state");
 	}
 
-	if (admin_rc != EXIT_SUCCESS || simulator_rc != EXIT_SUCCESS) {
+	if (admin_rc != EXIT_SUCCESS || discovery_rc != EXIT_SUCCESS || simulator_rc != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+int disable_topology_discovery_probes(MYSQL* admin, TestState& state) {
+	string query =
+		"SELECT variable_value FROM runtime_global_variables "
+		"WHERE variable_name='mysql-monitor_aws_rds_topology_discovery_interval'";
+
+	auto [rc, rows] = mysql_query_ext_rows(admin, query);
+	if (rc != EXIT_SUCCESS || rows.size() != 1 || rows[0].size() != 1) {
+		diag("Error: failed to read mysql-monitor_aws_rds_topology_discovery_interval");
+		return EXIT_FAILURE;
+	}
+
+	state.topology_discovery_interval = rows[0][0];
+	state.topology_discovery_interval_saved = true;
+
+	vector<string> queries {
+		"SET mysql-monitor_aws_rds_topology_discovery_interval=0",
+		"LOAD MYSQL VARIABLES TO RUNTIME",
+	};
+
+	int disable_rc = execute_all(admin, queries);
+	if (disable_rc != EXIT_SUCCESS) {
+		diag("Error: failed to disable automatic AWS topology discovery");
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -125,6 +173,13 @@ int test_irrelevant_server_fields(MYSQL* admin, RDS_BGD_Simulator& sim, TestStat
 		return EXIT_FAILURE;
 	}
 
+	// Disable automatic AWS topology discovery so its metadata queries are not
+	// mistaken for probes from the explicitly configured BGD worker.
+	int discovery_rc = disable_topology_discovery_probes(admin, state);
+	if (discovery_rc != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+
 	// Wait for the runtime BGD row to report AVAILABLE.
 	int status_rc = bgd_wait_for_status(admin, hg, "AVAILABLE", kTimeoutSeconds);
 	if (status_rc != EXIT_SUCCESS) {
@@ -141,7 +196,9 @@ int test_irrelevant_server_fields(MYSQL* admin, RDS_BGD_Simulator& sim, TestStat
 		return EXIT_FAILURE;
 	}
 
-	auto [probe_rc, probe] = sim.wait_for_probe_log(probe_seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0);
+	auto [probe_rc, probe] = sim.wait_for_probe_log(
+		probe_seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0
+	);
 	if (probe_rc != EXIT_SUCCESS) {
 		diag("Error: green writer did not receive the AVAILABLE metadata probe");
 		return EXIT_FAILURE;
@@ -210,7 +267,9 @@ int test_tls_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
 	}
 
 	// Wait for the active worker to use TLS without starting a table check.
-	auto [probe_rc, probe] = sim.wait_for_probe_log(seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1);
+	auto [probe_rc, probe] = sim.wait_for_probe_log(
+		seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1
+	);
 	if (probe_rc != EXIT_SUCCESS) {
 		diag("Error: green-writer metadata probe did not use TLS after refresh");
 		return EXIT_FAILURE;
@@ -287,6 +346,13 @@ int test_server_eligibility_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestSt
 	RDS_BGD_Cluster& cluster = state.cluster;
 	BGD_Hostgroups& hg = state.hostgroups;
 
+	// Record the probe sequence before changing green-writer eligibility.
+	auto [refresh_seq_rc, refresh_seq] = sim.probe_log_last_sequence();
+	if (refresh_seq_rc != EXIT_SUCCESS) {
+		diag("Error: failed to read the probe sequence before the OFFLINE_SOFT refresh");
+		return EXIT_FAILURE;
+	}
+
 	// Move the green writer to OFFLINE_SOFT.
 	string set_offline =
 		"UPDATE mysql_servers SET status='OFFLINE_SOFT' WHERE hostgroup_id=" + to_string(hg.green_writer) +
@@ -309,19 +375,24 @@ int test_server_eligibility_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestSt
 		return EXIT_FAILURE;
 	}
 
-	auto [offline_seq_rc, offline_seq] = sim.probe_log_last_sequence();
-	if (offline_seq_rc != EXIT_SUCCESS) {
-		diag("Error: failed to read the probe sequence after the OFFLINE_SOFT refresh");
+	// Wait for the worker to apply the refreshed server list and return to its eligible blue writer.
+	auto [blue_probe_rc, blue_probe] = sim.wait_for_probe_log(
+		refresh_seq, cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 0
+	);
+	if (blue_probe_rc != EXIT_SUCCESS) {
+		diag("Error: OFFLINE_SOFT refresh did not return metadata probing to the blue writer");
 		return EXIT_FAILURE;
 	}
 
-	int no_metadata_rc = bgd_expect_no_metadata_probe(sim, offline_seq, cluster.green_writer.endpoint(), kNegativeProbeTimeoutMs);
+	int no_metadata_rc =
+		bgd_expect_no_metadata_probe(sim, blue_probe.sequence_id, cluster.green_writer.endpoint(), kNegativeProbeTimeoutMs);
 	if (no_metadata_rc != EXIT_SUCCESS) {
 		diag("Error: OFFLINE_SOFT green writer continued receiving metadata probes");
 		return EXIT_FAILURE;
 	}
 
-	int offline_no_table_rc = bgd_expect_no_table_check(sim, offline_seq, state.topology_endpoints, kNegativeProbeTimeoutMs);
+	int offline_no_table_rc =
+		bgd_expect_no_table_check(sim, refresh_seq, state.topology_endpoints, kNegativeProbeTimeoutMs);
 	if (offline_no_table_rc != EXIT_SUCCESS) {
 		diag("Error: OFFLINE_SOFT refresh restarted BGD discovery");
 		return EXIT_FAILURE;
@@ -351,7 +422,9 @@ int test_server_eligibility_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestSt
 		return EXIT_FAILURE;
 	}
 
-	auto [probe_rc, probe] = sim.wait_for_probe_log(online_seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1);
+	auto [probe_rc, probe] = sim.wait_for_probe_log(
+		online_seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1
+	);
 	if (probe_rc != EXIT_SUCCESS) {
 		diag("Error: ONLINE green writer did not resume TLS metadata probes");
 		return EXIT_FAILURE;
@@ -422,17 +495,34 @@ int test_check_interval_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState&
 		return EXIT_FAILURE;
 	}
 
-	// No metadata probe should occur during the first half of the configured interval.
-	auto [early_rc, early_probe] = sim.wait_for_probe_log(baseline, cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kEarlyProbeTimeoutMs, -1);
-	if (early_rc != ETIMEDOUT) {
-		diag("Error: metadata probing occurred before half of check_interval_ms elapsed");
+	// Consume the immediate refresh probe and the first blue probe after the worker reaches NONE.
+	auto [first_rc, first_probe] =
+		sim.wait_for_probe_log(baseline, cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, -1);
+	if (first_rc != EXIT_SUCCESS) {
+		diag("Error: failed to observe the first blue metadata probe after the check_interval_ms refresh");
 		return EXIT_FAILURE;
 	}
 
-	// The next metadata probe should occur by 1.5 times the configured interval.
-	auto [next_rc, next_probe] = sim.wait_for_probe_log(baseline, cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kNextProbeTimeoutMs, -1);
+	auto [settled_rc, settled_probe] =
+		sim.wait_for_probe_log(first_probe.sequence_id, cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, -1);
+	if (settled_rc != EXIT_SUCCESS) {
+		diag("Error: failed to observe the settled blue metadata probe after the check_interval_ms refresh");
+		return EXIT_FAILURE;
+	}
+
+	// Measure the steady-state interval between consecutive blue metadata probes.
+	unsigned long long interval_start = monotonic_time();
+	auto [next_rc, next_probe] = sim.wait_for_probe_log(
+		settled_probe.sequence_id, cluster.blue_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kMaximumProbeIntervalMs, -1
+	);
 	if (next_rc != EXIT_SUCCESS) {
 		diag("Error: metadata probing did not occur within 1.5 times check_interval_ms");
+		return EXIT_FAILURE;
+	}
+
+	unsigned long long elapsed_ms = (monotonic_time() - interval_start) / 1000;
+	if (elapsed_ms < kMinimumProbeIntervalMs) {
+		diag("Error: consecutive metadata probes occurred before half of check_interval_ms elapsed");
 		return EXIT_FAILURE;
 	}
 
@@ -491,7 +581,7 @@ int main() {
 	}
 
 exit_cleanup:
-	if (cleanup(admin, sim) != EXIT_SUCCESS) {
+	if (cleanup(admin, sim, state) != EXIT_SUCCESS) {
 		diag("Error: failed to clean the BGD TAP state");
 		return EXIT_FAILURE;
 	}

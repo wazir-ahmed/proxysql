@@ -14,7 +14,8 @@
  * 5. Move a blue reader into writer hostgroup 1380 and publish topology that
  *    maps it to a different green target.
  * 6. Verify that the previous writer returns to hostgroup 1380, the newly
- *    mapped writer moves to hostgroup 1384, and stale target probing stops.
+ *    mapped writer moves to hostgroup 1384, uses TLS from green writer
+ *    hostgroup 1385, and stops probing the stale target.
  */
 
 #include <cerrno>
@@ -194,7 +195,9 @@ int test_hostgroup_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& stat
 	ok(true, "BGD status for wHG 1380 remains WRITER_SWITCHOVER_IN_PROGRESS after hostgroup refresh");
 
 	// Verify that the blue writer uses the refreshed reader hostgroup.
-	int refreshed_placement_rc = bgd_wait_for_server_placement(admin, refreshed_hg.blue_writer, refreshed_hg.blue_reader, cluster.blue_writer, true, kTimeoutSeconds);
+	int refreshed_placement_rc = bgd_wait_for_server_placement(
+		admin, refreshed_hg.blue_writer, refreshed_hg.blue_reader, cluster.blue_writer, true, kTimeoutSeconds
+	);
 	if (refreshed_placement_rc != EXIT_SUCCESS) {
 		diag("Error: blue writer did not move from reader hostgroup 1381 to 1384");
 		return EXIT_FAILURE;
@@ -203,7 +206,9 @@ int test_hostgroup_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& stat
 	ok(true, "hostgroup refresh moves the demoted blue writer from hostgroup 1381 to 1384");
 
 	// Require TLS from the green writer row in refreshed green writer hostgroup 1385.
-	auto [probe_rc, probe] = sim.wait_for_probe_log(seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1);
+	auto [probe_rc, probe] = sim.wait_for_probe_log(
+		seq, cluster.green_writer.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1
+	);
 	if (probe_rc != EXIT_SUCCESS) {
 		diag("Error: metadata probe did not use TLS from green writer hostgroup 1385");
 		return EXIT_FAILURE;
@@ -219,9 +224,11 @@ int test_hostgroup_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& stat
  * - Move the first blue reader from hostgroup 1384 to writer hostgroup 1380.
  * - Publish `SWITCHOVER_IN_PROGRESS` topology that maps it to the first green
  *   reader.
+ * - Move that green target from reader hostgroup 1386 to writer hostgroup
+ *   1385.
  * - Verify that the previous writer returns to hostgroup 1380.
  * - Verify that the newly mapped writer moves to hostgroup 1384.
- * - Verify that metadata probing uses TLS from the new green reader target.
+ * - Verify that metadata probing uses TLS from the new green writer target.
  */
 int test_mapped_writer_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& state) {
 	RDS_BGD_Cluster& cluster = state.cluster;
@@ -244,20 +251,26 @@ int test_mapped_writer_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& 
 		return EXIT_FAILURE;
 	}
 
-	// Move the first blue reader into writer hostgroup 1380 and load mysql_servers.
+	// Move the new blue/green writer pair into writer hostgroups 1380 and 1385.
 	string move_writer =
 		"UPDATE mysql_servers SET hostgroup_id=" + to_string(hg.blue_writer) +
 		" WHERE hostgroup_id=" + to_string(hg.blue_reader) +
 		" AND hostname=" + bgd_sql_quote(mapped_writer.hostname) +
 		" AND port=" + to_string(mapped_writer.port);
+	string move_target =
+		"UPDATE mysql_servers SET hostgroup_id=" + to_string(hg.green_writer) +
+		" WHERE hostgroup_id=" + to_string(hg.green_reader) +
+		" AND hostname=" + bgd_sql_quote(mapped_target.hostname) +
+		" AND port=" + to_string(mapped_target.port);
 	vector<string> queries {
 		move_writer,
+		move_target,
 		"LOAD MYSQL SERVERS TO RUNTIME",
 	};
 
 	int refresh_rc = execute_all(admin, queries);
 	if (refresh_rc != EXIT_SUCCESS) {
-		diag("Error: failed to move the new mapped writer into hostgroup 1380");
+		diag("Error: failed to move the new mapped writer pair into hostgroups 1380 and 1385");
 		return EXIT_FAILURE;
 	}
 
@@ -268,14 +281,18 @@ int test_mapped_writer_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& 
 		return EXIT_FAILURE;
 	}
 
-	auto [probe_rc, probe] = sim.wait_for_probe_log(seq, mapped_target.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1);
+	auto [probe_rc, probe] = sim.wait_for_probe_log(
+		seq, mapped_target.endpoint(), RDS_BGD_Probe_Kind::metadata, kProbeTimeoutMs, 1
+	);
 	if (probe_rc != EXIT_SUCCESS) {
-		diag("Error: metadata probing did not use TLS from green reader hostgroup 1386");
+		diag("Error: metadata probing did not use TLS from green writer hostgroup 1385");
 		return EXIT_FAILURE;
 	}
 
 	// Verify that the previous writer was restored to writer hostgroup 1380.
-	int previous_writer_rc = bgd_wait_for_server_placement(admin, hg.blue_writer, hg.blue_reader, previous_writer, false, kTimeoutSeconds);
+	int previous_writer_rc = bgd_wait_for_server_placement(
+		admin, hg.blue_writer, hg.blue_reader, previous_writer, false, kTimeoutSeconds
+	);
 	if (previous_writer_rc != EXIT_SUCCESS) {
 		diag("Error: previous blue writer was not restored to hostgroup 1380");
 		return EXIT_FAILURE;
@@ -284,7 +301,9 @@ int test_mapped_writer_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& 
 	ok(true, "mapped-writer refresh restores the previous blue writer from hostgroup 1384 to 1380");
 
 	// Verify that the newly mapped writer was demoted to reader hostgroup 1384.
-	int mapped_writer_rc = bgd_wait_for_server_placement(admin, hg.blue_writer, hg.blue_reader, mapped_writer, true, kTimeoutSeconds);
+	int mapped_writer_rc = bgd_wait_for_server_placement(
+		admin, hg.blue_writer, hg.blue_reader, mapped_writer, true, kTimeoutSeconds
+	);
 	if (mapped_writer_rc != EXIT_SUCCESS) {
 		diag("Error: newly mapped writer did not move to reader hostgroup 1384");
 		return EXIT_FAILURE;
@@ -293,13 +312,14 @@ int test_mapped_writer_refresh(MYSQL* admin, RDS_BGD_Simulator& sim, TestState& 
 	ok(true, "mapped-writer refresh moves the new blue writer from hostgroup 1380 to 1384");
 
 	// Verify that the previous green target receives no metadata probes after the new target.
-	int stale_probe_rc = bgd_expect_no_metadata_probe(sim, probe.sequence_id, cluster.green_writer.endpoint(), kNegativeProbeTimeoutMs);
+	int stale_probe_rc =
+		bgd_expect_no_metadata_probe(sim, probe.sequence_id, cluster.green_writer.endpoint(), kNegativeProbeTimeoutMs);
 	if (stale_probe_rc != EXIT_SUCCESS) {
 		diag("Error: previous green target continued receiving metadata probes");
 		return EXIT_FAILURE;
 	}
 
-	ok(true, "mapped-writer refresh uses TLS from hostgroup 1386 and stops probing the previous target");
+	ok(true, "mapped-writer refresh uses TLS from hostgroup 1385 and stops probing the previous target");
 	return EXIT_SUCCESS;
 }
 
@@ -325,7 +345,7 @@ int main() {
 
 	// Simulator: publish SWITCHOVER_IN_PROGRESS with the first reader pair as the writer pair.
 	// ProxySQL: move the first blue reader from hostgroup 1384 to writer hostgroup 1380.
-	// Verify: the previous writer is restored, the new writer is demoted, and probing uses TLS from hostgroup 1386.
+	// Verify: the previous writer is restored, the new writer is demoted, and probing uses TLS from hostgroup 1385.
 	if (test_mapped_writer_refresh(admin, sim, state) != EXIT_SUCCESS) {
 		goto exit_cleanup;
 	}
