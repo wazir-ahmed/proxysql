@@ -7212,7 +7212,6 @@ void MySQL_Monitor::aws_rds_bgd_build_map(AWS_RDS_BGD_State& st, AWS_RDS_Topolog
 
 				// read the green writer's use_ssl config
 				if (st.green_writer_hg >= 0) {
-					p.green_eligible = false;
 					MyHGC* gwhgc = MyHGM->MyHGC_find((unsigned int)st.green_writer_hg);
 					if (gwhgc && gwhgc->mysrvs) {
 						for (unsigned int k = 0; k < gwhgc->mysrvs->cnt(); k++) {
@@ -7221,10 +7220,11 @@ void MySQL_Monitor::aws_rds_bgd_build_map(AWS_RDS_BGD_State& st, AWS_RDS_Topolog
 								continue;
 							}
 
-							if (gs->get_status() != MYSQL_SERVER_STATUS_OFFLINE_HARD
-								&& gs->get_status() != MYSQL_SERVER_STATUS_OFFLINE_SOFT) {
+							p.green_offline =
+								gs->get_status() == MYSQL_SERVER_STATUS_OFFLINE_HARD
+								|| gs->get_status() == MYSQL_SERVER_STATUS_OFFLINE_SOFT;
+							if (!p.green_offline) {
 								p.green_use_ssl = gs->use_ssl;
-								p.green_eligible = true;
 							}
 							break;
 						}
@@ -7301,7 +7301,7 @@ void MySQL_Monitor::aws_rds_bgd_build_map(AWS_RDS_BGD_State& st, AWS_RDS_Topolog
 void MySQL_Monitor::aws_rds_bgd_resolve_green_ips(AWS_RDS_BGD_State& st) {
 	int ai_family = mysql_resolution_family_to_ai_family(mysql_thread___resolution_family);
 	for (auto &p : st.bg_map) {
-		if (!p.green_eligible) {
+		if (p.green_offline) {
 			continue;
 		}
 
@@ -7333,7 +7333,7 @@ void MySQL_Monitor::aws_rds_bgd_resolve_green_ips(AWS_RDS_BGD_State& st) {
 
 	// Pin the worker's next probe to the green writer's IP (observe the switchover from green).
 	for (const AWS_RDS_BlueGreenPair& p : st.bg_map) {
-		if (p.is_writer && p.green_eligible && !p.green_ip.empty()) {
+		if (p.is_writer && !p.green_offline && !p.green_ip.empty()) {
 			if (st.next_check_host != p.green_ip) {
 				st.next_check_host = p.green_ip;
 				proxy_info("AWS RDS BGD [wHG=%u rHG=%u]: pinning rds_topology probe to green IP %s\n",
@@ -7366,7 +7366,7 @@ void MySQL_Monitor::aws_rds_bgd_add_green_writer_in_hg(AWS_RDS_BGD_State& st) {
 			MySrvC* s = MyHGM->find_server_in_hg((unsigned int)st.green_writer_hg, p.green_host, p.port);
 			if (s) {
 				p.green_use_ssl = s->use_ssl;
-				p.green_eligible = true;
+				p.green_offline = false;
 			}
 			MyHGM->publish_mysql_servers_to_runtime();
 		}
