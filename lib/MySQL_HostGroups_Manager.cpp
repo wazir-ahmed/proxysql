@@ -1550,7 +1550,7 @@ bool MySQL_HostGroups_Manager::commit(
 
 		// AWS RDS
 		if (incoming_aws_rds_bgd_hostgroups) {
-			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "RECONCILE mysql_aws_rds_bgd_hostgroups\n");
+			proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "DELETE FROM mysql_aws_rds_bgd_hostgroups\n");
 			generate_mysql_aws_rds_bgd_hostgroups_table();
 		}
 
@@ -6494,12 +6494,13 @@ void MySQL_HostGroups_Manager::generate_mysql_aws_aurora_hostgroups_table() {
 }
 
 /**
- * @brief Reconciles the runtime `mysql_aws_rds_bgd_hostgroups` table with its staged configuration.
+ * @brief Regenerates the runtime in-memory `mysql_aws_rds_bgd_hostgroups` table from `incoming_aws_rds_bgd_hostgroups`.
  *
- * @details `writer_hostgroup` identifies a deployment. Existing rows are updated without changing their runtime-only
- * `status`; new rows start at `NONE`, and rows missing from the staged configuration are removed. Rows whose unique
- * `reader_hostgroup` changes are removed before inserts and retain their prior status when reinserted. Config-loaded
- * rows are user-defined, so `auto_generated` is set to 0. Optional green hostgroups remain SQL NULL when absent.
+ * @details The incoming resultset comes from the admin config table (11 columns, no `auto_generated`); config-loaded
+ * entries are user-defined, so `auto_generated` is stored as 0. `green_writer_hostgroup` and
+ * `green_reader_hostgroup` are optional and bound as SQL NULL when absent.
+ *
+ * @note Existing deployments preserve their runtime `status` while configured fields are reloaded.
  */
 void MySQL_HostGroups_Manager::generate_mysql_aws_rds_bgd_hostgroups_table() {
 	if (incoming_aws_rds_bgd_hostgroups==NULL) {
@@ -6522,8 +6523,7 @@ void MySQL_HostGroups_Manager::generate_mysql_aws_rds_bgd_hostgroups_table() {
 	int cols = 0;
 	int affected_rows = 0;
 	SQLite3_result* resultset = NULL;
-	const char* select_query =
-		"SELECT writer_hostgroup,reader_hostgroup,status FROM mysql_aws_rds_bgd_hostgroups";
+	const char* select_query = "SELECT writer_hostgroup, reader_hostgroup, status FROM mysql_aws_rds_bgd_hostgroups";
 	mydb->execute_statement(select_query, &error, &cols, &affected_rows, &resultset);
 	if (error) {
 		proxy_error("Error on %s : %s\n", select_query, error);
@@ -6533,18 +6533,14 @@ void MySQL_HostGroups_Manager::generate_mysql_aws_rds_bgd_hostgroups_table() {
 	}
 	if (resultset) {
 		for (SQLite3_row* row : resultset->rows) {
-			runtime_rows.emplace(
-				atoi(row->fields[0]),
-				RuntimeRow { atoi(row->fields[1]), atoi(row->fields[2]) }
-			);
+			runtime_rows.emplace(atoi(row->fields[0]), RuntimeRow {atoi(row->fields[1]), atoi(row->fields[2])});
 		}
 		delete resultset;
 		resultset = NULL;
 	}
 
 	int rc;
-	const char* delete_query =
-		"DELETE FROM mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=?1";
+	const char* delete_query = "DELETE FROM mysql_aws_rds_bgd_hostgroups WHERE writer_hostgroup=?1";
 	auto [delete_rc, delete_statement_unique] = mydb->prepare_v2(delete_query);
 	ASSERT_SQLITE_OK(delete_rc, mydb);
 	sqlite3_stmt* delete_statement = delete_statement_unique.get();
@@ -6566,8 +6562,8 @@ void MySQL_HostGroups_Manager::generate_mysql_aws_rds_bgd_hostgroups_table() {
 
 	const char* update_query =
 		"UPDATE mysql_aws_rds_bgd_hostgroups SET "
-			"reader_hostgroup=?1,green_writer_hostgroup=?2,green_reader_hostgroup=?3,active=?4,"
-			"writer_is_also_reader=?5,check_interval_ms=?6,check_timeout_ms=?7,comment=?8,auto_generated=?9 "
+			"reader_hostgroup=?1, green_writer_hostgroup=?2, green_reader_hostgroup=?3, active=?4, "
+			"writer_is_also_reader=?5, check_interval_ms=?6, check_timeout_ms=?7, comment=?8, auto_generated=?9 "
 		"WHERE writer_hostgroup=?10";
 	auto [update_rc, update_statement_unique] = mydb->prepare_v2(update_query);
 	ASSERT_SQLITE_OK(update_rc, mydb);
@@ -6575,14 +6571,14 @@ void MySQL_HostGroups_Manager::generate_mysql_aws_rds_bgd_hostgroups_table() {
 
 	const char* insert_query =
 		"INSERT INTO mysql_aws_rds_bgd_hostgroups("
-			"writer_hostgroup,reader_hostgroup,green_writer_hostgroup,green_reader_hostgroup,active,"
-			"writer_is_also_reader,check_interval_ms,check_timeout_ms,comment,auto_generated,status"
+			"writer_hostgroup, reader_hostgroup, green_writer_hostgroup, green_reader_hostgroup, active,"
+			"writer_is_also_reader, check_interval_ms, check_timeout_ms, comment, auto_generated, status"
 		") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 	auto [insert_rc, insert_statement_unique] = mydb->prepare_v2(insert_query);
 	ASSERT_SQLITE_OK(insert_rc, mydb);
 	sqlite3_stmt* insert_statement = insert_statement_unique.get();
 
-	proxy_info("Reconciling mysql_aws_rds_bgd_hostgroups table\n");
+	proxy_info("New mysql_aws_rds_bgd_hostgroups table\n");
 
 	for (SQLite3_row* r : incoming_aws_rds_bgd_hostgroups->rows) {
 		int writer_hostgroup=atoi(r->fields[0]);
