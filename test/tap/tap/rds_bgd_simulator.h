@@ -66,13 +66,6 @@ public:
 	vector<Endpoint> get_writers();
 
 	/**
-	 * @brief Returns both writer hostname/port endpoints for read-only simulation.
-	 *
-	 * @return Blue and green writer endpoints keyed by RDS hostname.
-	 */
-	vector<Endpoint> get_writer_hosts();
-
-	/**
 	 * @brief Returns the blue writer and configured blue readers.
 	 *
 	 * @return Blue deployment endpoints keyed by simulator IP address.
@@ -193,17 +186,6 @@ public:
 	 * @return EXIT_SUCCESS when the simulator state is empty; EXIT_FAILURE otherwise.
 	 */
 	int cleanup();
-
-	/**
-	 * @brief Waits until no new probe telemetry is recorded for a quiet interval.
-	 *
-	 * @param timeout_ms Maximum total wait.
-	 * @param quiet_ms Required interval without a new probe.
-	 *
-	 * @return EXIT_SUCCESS after the quiet interval, ETIMEDOUT on timeout, or
-	 *   EXIT_FAILURE when telemetry cannot be read.
-	 */
-	int wait_for_probe_quiescence(uint32_t timeout_ms, uint32_t quiet_ms);
 
 	/**
 	 * @brief Reads the latest sequence from the RDS BGD probe log.

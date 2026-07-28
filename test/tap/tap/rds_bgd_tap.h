@@ -160,77 +160,6 @@ inline int bgd_admin_cleanup(MYSQL* admin) {
 	return EXIT_SUCCESS;
 }
 
-inline int bgd_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
-	int admin_rc = bgd_admin_cleanup(admin);
-	if (admin_rc != EXIT_SUCCESS) {
-		diag("Error: failed to clean ProxySQL BGD test state");
-	}
-
-	int simulator_rc = sim.cleanup();
-	if (simulator_rc != EXIT_SUCCESS) {
-		diag("Error: failed to clean SQLite3-server simulator state");
-	}
-
-	if (admin_rc != EXIT_SUCCESS || simulator_rc != EXIT_SUCCESS) {
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
-}
-
-// Temporary compatibility for BGD TAP files that still use exit-time cleanup.
-namespace bgd_cleanup_detail {
-
-static MYSQL* exit_admin = nullptr;
-static RDS_BGD_Simulator* exit_simulator = nullptr;
-static bool exit_handler_registered = false;
-
-inline void cleanup_at_exit() {
-	if (exit_admin == nullptr || exit_simulator == nullptr) {
-		return;
-	}
-
-	MYSQL* admin = exit_admin;
-	RDS_BGD_Simulator* simulator = exit_simulator;
-	exit_admin = nullptr;
-	exit_simulator = nullptr;
-
-	int rc = bgd_test_cleanup(admin, *simulator);
-	if (rc != EXIT_SUCCESS) {
-		diag("Error: exit-time BGD TAP cleanup failed");
-	}
-}
-
-}  // namespace bgd_cleanup_detail
-
-inline int bgd_register_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
-	using namespace bgd_cleanup_detail;
-	if (exit_admin != nullptr || exit_simulator != nullptr) {
-		diag("Error: BGD TAP cleanup is already registered");
-		return EALREADY;
-	}
-
-	if (!exit_handler_registered) {
-		if (atexit(cleanup_at_exit) != 0) {
-			diag("Error: failed to register exit-time BGD TAP cleanup");
-			return EXIT_FAILURE;
-		}
-		exit_handler_registered = true;
-	}
-
-	exit_admin = admin;
-	exit_simulator = &sim;
-	return EXIT_SUCCESS;
-}
-
-inline int bgd_finish_test_cleanup(MYSQL* admin, RDS_BGD_Simulator& sim) {
-	int cleanup_rc = bgd_test_cleanup(admin, sim);
-	if (cleanup_rc == EXIT_SUCCESS) {
-		bgd_cleanup_detail::exit_admin = nullptr;
-		bgd_cleanup_detail::exit_simulator = nullptr;
-	}
-	return cleanup_rc;
-}
-
 inline int bgd_admin_add_servers(
 	MYSQL* admin, RDS_BGD_Cluster cluster, BGD_Hostgroups hostgroups,
 	vector<RDS_BGD_Host> hosts, bool green, int use_ssl)
@@ -435,34 +364,6 @@ inline int bgd_wait_for_server_placement(
 
 	int rc = bgd_wait_for_condition(admin, query, timeout_seconds);
 	return rc;
-}
-
-// Temporary compatibility for unreviewed TAP files using the old diagnostic arguments.
-inline int bgd_wait_for_condition(
-	MYSQL* admin, string query, uint32_t timeout_seconds, RDS_BGD_Simulator&,
-	uint64_t, string, string, string, int, vector<int>)
-{
-	int rc = bgd_wait_for_condition(admin, query, timeout_seconds);
-	return rc;
-}
-
-inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe(
-	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend,
-	RDS_BGD_Probe_Kind kind, uint32_t timeout_ms, int encrypted)
-{
-	rc_t<RDS_BGD_Probe_Log> result =
-		sim.wait_for_probe_log(sequence, backend, kind, timeout_ms, encrypted);
-	return result;
-}
-
-// Temporary compatibility for unreviewed TAP files using the old diagnostic arguments.
-inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe(
-	RDS_BGD_Simulator& sim, uint64_t sequence, Endpoint backend, RDS_BGD_Probe_Kind kind,
-	uint32_t timeout_ms, int encrypted, MYSQL*, string, string, int, vector<int>)
-{
-	rc_t<RDS_BGD_Probe_Log> result =
-		bgd_wait_for_probe(sim, sequence, backend, kind, timeout_ms, encrypted);
-	return result;
 }
 
 inline rc_t<RDS_BGD_Probe_Log> bgd_wait_for_probe_from_backends(
